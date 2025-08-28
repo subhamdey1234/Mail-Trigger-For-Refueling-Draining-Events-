@@ -8,6 +8,8 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="ClosedXML" Version="0.105.0" />
+    <PackageReference Include="EPPlus" Version="8.1.0" />
     <PackageReference Include="MailKit" Version="4.13.0" />
     <PackageReference Include="Npgsql" Version="9.0.3" />
   </ItemGroup>
