@@ -1,0 +1,1201 @@
+﻿from sqlalchemy import create_engine, text
+from datetime import datetime, timedelta
+import urllib.parse
+import logging
+import pandas as pd
+import json
+import requests
+import pytz
+from sqlalchemy import BigInteger
+
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+class DatabaseConfig:
+    """Database configuration class"""
+    def __init__(self, env_name, username, password, hostname, port='5432', db_name='citus'):
+        self.env_name = env_name
+        self.username = username
+        self.password = urllib.parse.quote_plus(password)
+        self.hostname = hostname
+        self.port = port
+        self.db_name = db_name
+        self.uri_template = "postgresql://{}:{}@{}:{}/{}"
+
+    def get_uri(self):
+        return self.uri_template.format(
+            self.username,
+            self.password,
+            self.hostname,
+            self.port,
+            self.db_name
+        )
+
+
+class AlertSystem:
+    """Unified Speed Alert and Geofence Alert Detection System"""
+   
+    def __init__(self, dev_config, prod_config):
+        """Initialize with development and production database configs"""
+        self.dev_engine = create_engine(dev_config.get_uri(), pool_pre_ping=True)
+        self.prod_engine = create_engine(prod_config.get_uri(), pool_pre_ping=True)
+        self.last_processed_time = None
+        self.geofence_cache = {}
+        self.timezone_cache = {}
+        self.email_api_url = "https://assetinsight.lntecc.com/safetyapplication/api/Email/GetMailAddress"
+        self.email_username = "LNTNxTEm@ilAgentAdmin"
+        self.email_password = "B4c9G5vtfsMAw@"
+
+        self.timezone_map = {
+            'ist': 'Asia/Kolkata',
+            'arabian standard time': 'Asia/Dubai',
+            'arabic standard time': 'Asia/Riyadh',
+            'Arabian Standard Time': 'Asia/Dubai',
+            'Arabic Standard Time': 'Asia/Riyadh',
+            'utc': 'UTC',
+            'none': 'Asia/Kolkata',
+            'null': 'Asia/Kolkata',
+            '': 'Asia/Kolkata',
+            'indian standard time': 'Asia/Kolkata'
+        }
+    
+    def _get_normalized_timezone(self, time_zone_str: str) -> str:
+        """Normalize timezone string from database and return IANA timezone"""
+        if not time_zone_str:
+            return 'Asia/Kolkata'
+        
+        normalized = str(time_zone_str).strip().lower()
+        
+        if normalized in self.timezone_map:
+            logger.debug(f"Direct match found for timezone '{time_zone_str}' -> '{self.timezone_map[normalized]}'")
+            return self.timezone_map[normalized]
+
+        for key, value in self.timezone_map.items():
+            if key and (key in normalized or normalized in key):
+                return value
+        
+        if 'arabic' in normalized and 'arabian' not in normalized:
+            return 'Asia/Riyadh'
+        if 'arabian' in normalized:
+            return 'Asia/Dubai'
+        
+        logger.warning(f"Unknown timezone '{time_zone_str}' - defaulting to Asia/Kolkata")
+        return 'Asia/Kolkata'
+
+    def _cache_all_job_timezones(self):
+        """Cache ALL job timezones at once - OPTIMIZED SINGLE QUERY"""
+        try:
+            logger.info("Caching all job timezones from d_lntassetmaster...")
+            with self.prod_engine.connect() as conn:
+                results = conn.execute(
+                    text("""
+                    SELECT DISTINCT jobcode, time_zone
+                    FROM "Fuel_Prod".d_lntassetmaster
+                    WHERE jobcode IS NOT NULL
+                    """)
+                ).fetchall()
+                
+                for row in results:
+                    job_code = str(row.jobcode).strip()
+                    self.timezone_cache[job_code] = self._get_normalized_timezone(row.time_zone)
+                
+                logger.info(f"✓ Cached {len(self.timezone_cache)} job timezones")
+                
+                for job, tz in list(self.timezone_cache.items())[:5]:
+                    logger.debug(f"  {job} -> {tz}")
+        except Exception as e:
+            logger.warning(f"Error caching timezones: {str(e)}")
+
+    def _get_job_timezone_from_assets(self, job_code: str) -> str:
+        """Get timezone from cache - O(1) lookup"""
+        if job_code in self.timezone_cache:
+            return self.timezone_cache[job_code]
+        logger.warning(f"Job code {job_code} not found in cache, using default Asia/Kolkata")
+        return 'Asia/Kolkata'
+
+    def _convert_rtc_to_job_timezone(self, rtc_time: datetime, job_code: str) -> datetime:
+        """
+        Interpret rtc_time as job-local time and return it in the job timezone.
+        IMPORTANT: Does NOT assume rtc_time is UTC.
+        """
+        try:
+            job_tz_str = self._get_job_timezone_from_assets(job_code)
+            job_tz = pytz.timezone(job_tz_str)
+
+            # handle pandas timestamp
+            if isinstance(rtc_time, pd.Timestamp):
+                rtc_time = rtc_time.to_pydatetime()
+
+            if rtc_time is None:
+                return rtc_time
+
+            # Case 1: naive datetime from DB => assume it's already job-local time
+            if rtc_time.tzinfo is None:
+                return job_tz.localize(rtc_time)
+
+            # Case 2: tz-aware datetime => convert to job timezone
+            return rtc_time
+ 
+        except Exception as e:
+            logger.warning(f"Timezone conversion error for {job_code}: {str(e)}")
+            return rtc_time
+
+
+
+    def test_connections(self):
+        """Test both database connections"""
+        connections = {
+            'Development': self.dev_engine,
+            'Production': self.prod_engine
+        }
+       
+        for env_name, engine in connections.items():
+            try:
+                with engine.connect() as conn:
+                    conn.execute(text("SELECT 1")).scalar()
+                logger.info(f"{env_name} database connection successful!")
+            except Exception as e:
+                logger.error(f"{env_name} database connection failed: {str(e)}")
+                raise
+
+    def _get_speed_alerts_query(self):
+        """Get the SQL query for fetching speed alerts with 5-sequence validation"""
+        
+        end_time = datetime.now()
+        start_time = end_time - timedelta(minutes=45)
+        
+        query = text("""
+WITH timezone_mapping AS (
+    SELECT
+        a.*,
+        CASE 
+            WHEN a.time_zone IS NULL OR a.time_zone = '' 
+            THEN 'Asia/Kolkata'
+            WHEN a.time_zone = 'Arabic Standard Time'
+            THEN 'Asia/Riyadh'
+            WHEN a.time_zone = 'Arabian Standard Time'
+            THEN 'Asia/Dubai'
+            ELSE 'Asia/Kolkata'
+        END AS mapped_timezone
+    FROM "Fuel_Prod".d_lntassetmaster a
+),
+
+params AS (
+    SELECT 0.0001::NUMERIC AS move_eps
+),
+
+latest_data AS (
+    SELECT
+        r.rtc AS occurred_on,
+        r.tag_29 AS ignition,                                
+        r.tag_386::NUMERIC AS latitude,
+        r.tag_387::NUMERIC AS longitude,
+        tm.jobcode AS job_code,
+        tm.asset_code,
+        r.deviceid,
+        r.tag_388::INT AS speed,
+        tm.assettypename,
+        tm.movementtype,
+        CASE 
+            WHEN LOWER(TRIM(COALESCE(vw.ic_name, ''))) IN ('Renewable', 'LTSA IC','renewable','ltsa ic')
+            THEN 125
+            ELSE 60
+        END AS safe_speed_limit,
+        tm.mapped_timezone,
+        ROW_NUMBER() OVER (PARTITION BY r.deviceid, r.rtc ORDER BY tm.platform_asset_id) AS rn
+    FROM timezone_mapping tm
+                     
+LEFT JOIN "Fuel_Prod"."VW_JOBMASTER" vw
+      ON vw.asset_code = tm.asset_code
+
+    JOIN "Fuel_Prod".r_fuel r
+      ON tm.platform_asset_id = r.deviceid
+    WHERE r.rtc > (CURRENT_TIMESTAMP AT TIME ZONE tm.mapped_timezone - INTERVAL '30 minutes')
+      AND r.rtc <= CURRENT_TIMESTAMP AT TIME ZONE tm.mapped_timezone
+      AND r.tag_388 IS NOT NULL
+),
+
+deduped AS (
+    SELECT
+        occurred_on, ignition, latitude, longitude, job_code, asset_code,
+        deviceid, speed, assettypename, movementtype, safe_speed_limit, mapped_timezone
+    FROM latest_data
+    WHERE rn = 1
+),
+
+with_prev AS (
+    SELECT
+        d.*,
+        LAG(latitude)  OVER (PARTITION BY deviceid ORDER BY occurred_on) AS prev_lat,
+        LAG(longitude) OVER (PARTITION BY deviceid ORDER BY occurred_on) AS prev_lon
+    FROM deduped d
+),
+
+movement_and_limit AS (
+    SELECT
+        wp.*,
+        CASE
+            WHEN prev_lat IS NULL OR prev_lon IS NULL THEN TRUE
+            WHEN ABS(latitude - prev_lat) >= (SELECT move_eps FROM params)
+              OR ABS(longitude - prev_lon) >= (SELECT move_eps FROM params)
+            THEN TRUE
+            ELSE FALSE
+        END AS is_moving,
+        CASE WHEN speed > wp.safe_speed_limit THEN TRUE ELSE FALSE END AS over_limit
+    FROM with_prev wp
+),
+
+runs AS (
+    SELECT
+        *,
+        CASE
+            WHEN over_limit = TRUE
+             AND COALESCE(LAG(over_limit) OVER (PARTITION BY deviceid ORDER BY occurred_on), FALSE) = FALSE
+            THEN 1 ELSE 0
+        END AS start_flag
+    FROM movement_and_limit
+),
+
+grouped AS (
+    SELECT
+        *,
+        SUM(start_flag) OVER (PARTITION BY deviceid ORDER BY occurred_on
+                              ROWS UNBOUNDED PRECEDING) AS grp_id
+    FROM runs
+),
+
+eligible AS (
+    SELECT *
+    FROM grouped
+    WHERE is_moving = TRUE AND over_limit = TRUE
+),
+
+streaks AS (
+    SELECT
+        *,
+        COUNT(*) OVER (PARTITION BY deviceid, grp_id) AS streak_len,
+        ROW_NUMBER() OVER (PARTITION BY deviceid, grp_id ORDER BY occurred_on) AS rn_in_grp
+    FROM eligible
+),
+
+first5_min AS (
+    SELECT
+        deviceid, grp_id,
+        MIN(speed) AS min_speed_first5
+    FROM streaks
+    WHERE rn_in_grp BETWEEN 1 AND 5
+    GROUP BY deviceid, grp_id
+),
+
+event_starts AS (
+    SELECT
+        s.deviceid,
+        s.job_code,
+        s.asset_code,
+        s.occurred_on,
+        s.ignition,
+        s.latitude,
+        s.longitude,
+        f5.min_speed_first5 AS speed,
+        s.assettypename,
+        s.movementtype,
+        s.safe_speed_limit,
+        s.streak_len,
+        s.mapped_timezone
+    FROM streaks s
+    JOIN first5_min f5
+      ON s.deviceid = f5.deviceid AND s.grp_id = f5.grp_id
+    WHERE s.streak_len >= 5
+      AND s.rn_in_grp = 1
+)
+
+SELECT
+    deviceid, job_code, asset_code, occurred_on, ignition, latitude, longitude,
+    speed, assettypename, movementtype, safe_speed_limit, streak_len, mapped_timezone
+FROM event_starts
+ORDER BY occurred_on asc
+        """)
+        return query, {"start_time": start_time, "end_time": end_time}
+    
+    def _get_geofence_alerts_query(self):
+        """Get the SQL query for fetching geofence speed violations"""
+        return text("""
+    WITH job_timezone AS (
+        SELECT DISTINCT ON (a.jobcode)
+            a.jobcode,
+            CASE
+                WHEN a.time_zone IS NULL
+                  OR a.time_zone = ''
+                    THEN 'Asia/Kolkata'
+                WHEN a.time_zone = 'Arabic Standard Time'
+                    THEN 'Asia/Riyadh'
+                WHEN a.time_zone = 'Arabian Standard Time'
+                    THEN 'Asia/Dubai'
+                ELSE 'Asia/Kolkata'
+            END AS mapped_timezone
+        FROM "Fuel_Prod".d_lntassetmaster a
+        WHERE a.jobcode = ANY(:jobcodes)
+    )
+    SELECT
+        rpt.deviceid::BIGINT AS deviceid,
+        rpt.jobcode          AS job_code,
+        rpt.asset_code,
+        (rpt.start_time AT TIME ZONE jt.mapped_timezone) AS occurred_on,
+        rpt.tag_29           AS ignition,
+        rpt.tag_386          AS latitude,
+        rpt.tag_387          AS longitude,
+        rpt.speed,
+        rpt.assettypename,
+        jt.mapped_timezone
+    FROM job_timezone jt
+    CROSS JOIN LATERAL "Fuel_Prod".new_speed_limit_report(
+        :jobcodes,
+        :asset_codes,
+        (:start_time AT TIME ZONE jt.mapped_timezone)::timestamp,
+        (:end_time   AT TIME ZONE jt.mapped_timezone)::timestamp,
+        :speed_limit,
+        'Inside Geofence'
+    ) AS rpt
+    WHERE rpt.jobcode = jt.jobcode
+    ORDER BY occurred_on ASC;
+    """).bindparams(
+        bindparam("jobcodes",    value=[], type_=ARRAY(String())),  # ✅ tells SQLAlchemy it's a text[]
+        bindparam("asset_codes", value=[], type_=ARRAY(String())),  # ✅ same for asset_codes
+    )
+
+    def _get_geofence_names(self, jobcode: str) -> dict:
+        """Fetch all geofence names for a jobcode from d_geo_fence table"""
+        cache_key = f"geofence_{jobcode}"
+        
+        if cache_key in self.geofence_cache:
+            return self.geofence_cache[cache_key]
+        
+        try:
+            geofence_map = {}
+            with self.prod_engine.connect() as conn:
+                results = conn.execute(
+                    text("""
+                    SELECT id, gf_name
+                    FROM "Fuel_Prod".d_geo_fence
+                    WHERE job_code = :jobcode
+                      AND is_active = TRUE
+                      AND gf_name IS NOT NULL
+                    ORDER BY gf_name
+                    """),
+                    {"jobcode": jobcode}
+                ).fetchall()
+                
+                for row in results:
+                    geofence_map[str(row.id)] = str(row.gf_name).strip()
+            
+            self.geofence_cache[cache_key] = geofence_map
+            logger.debug(f"Cached {len(geofence_map)} geofences for jobcode {jobcode}")
+            return geofence_map
+            
+        except Exception as error:
+            logger.warning(f"Error fetching geofence names for jobcode {jobcode}: {str(error)}")
+            return {}
+
+    def _get_job_contact_details(self, job_code: str) -> dict:
+        """Fetch job contact details from production database"""
+        try:
+            with self.prod_engine.connect() as conn:
+                result = conn.execute(
+                    text("""
+                    SELECT 
+                        job_code, 
+                        pm_email, 
+                        pnm_email, 
+                        accountant_email, 
+                        siteengineer_email
+                    FROM "Fuel_Prod".d_job_info
+                    WHERE job_code = :job_code
+                    """),
+                    {"job_code": job_code}
+                ).fetchone()
+                
+                if result:
+                    return dict(result._mapping)
+                else:
+                    logger.warning(f"No contact details found for jobcode: {job_code}")
+                    return {}
+        except Exception as error:
+            logger.warning(f"Error fetching contact details for jobcode {job_code}: {str(error)}")
+            return {}
+
+    def _get_inserted_alerts_for_email(self, job_code: str, minutes: int = 30):
+        """Fetch recently inserted alerts from d_notification table"""
+        try:
+            job_timezone = self._get_job_timezone_from_assets(job_code)
+            now = datetime.now()
+            start_time = now - timedelta(minutes=minutes)
+
+            
+            
+            logger.debug(f"Fetching alerts for {job_code} using timezone: {job_timezone}")
+            
+            with self.prod_engine.connect() as conn:
+                results = conn.execute(
+                    text("""
+                    WITH timezone_mapping AS (
+    SELECT
+        a.*,
+        CASE 
+            WHEN a.time_zone IS NULL OR a.time_zone = '' 
+            THEN 'Asia/Kolkata'
+            WHEN a.time_zone = 'Arabic Standard Time'
+            THEN 'Asia/Riyadh'
+            WHEN a.time_zone = 'Arabian Standard Time'
+            THEN 'Asia/Dubai'
+            ELSE 'Asia/Kolkata'
+        END AS mapped_timezone
+    FROM "Fuel_Prod".d_lntassetmaster a
+                         
+)
+SELECT DISTINCT
+    n.deviceid,
+    n.job_code,
+    COALESCE(jm.job_desc, 'N/A') AS job_desc,
+    n.asset_code,
+    COALESCE(am.assettypename, n.assettypename, 'N/A') AS assettypename,
+    COALESCE(am.vehicle_registration_no, 'N/A') AS vehicle_registration_no,
+    COALESCE(mdm.agency_name, 'N/A') AS agency_name,
+    COALESCE(mdm.driver_name, 'N/A') AS drivername,
+    COALESCE(mdm.phone_number, 'N/A') AS phonenumber,
+    n.occured_on,
+    n.speed,
+    COALESCE(
+        gf.speed_limit,
+        CASE 
+            WHEN LOWER(TRIM(COALESCE(vw.ic_name, ''))) IN ('Renewable', 'LTSA IC','renewable','ltsa ic')
+            THEN 125
+            ELSE 60
+        END
+    ) AS "Safespeed",
+    n.latitude,
+    n.longitude,
+    COALESCE(gf.gf_name, n.geofence_name, 'N/A') AS geofence_name,
+    COALESCE(tm.mapped_timezone) AS asset_time_zone
+FROM "Fuel_Prod".d_notification AS n
+ LEFT JOIN timezone_mapping AS tm
+    ON tm.jobcode = n.job_code
+    AND tm.asset_code = n.asset_code
+LEFT JOIN "Fuel_Prod".d_lntassetmaster AS am
+    ON am.jobcode = n.job_code
+    AND am.asset_code = n.asset_code
+
+LEFT JOIN "Fuel_Prod"."VW_JOBMASTER" vw
+      ON vw.asset_code = n.asset_code
+                      
+
+LEFT JOIN "Fuel_Prod".d_geo_fence AS gf
+    ON gf.gf_name = n.geofence_name
+    AND gf.job_code = n.job_code
+LEFT JOIN "Fuel_Prod".d_job_master AS jm
+    ON jm.job_code = n.job_code
+LEFT JOIN "Fuel_Prod".d_asset_mapping AS dam
+    ON am.platform_asset_id = dam.device_id
+LEFT JOIN "Fuel_Prod".m_driver_master AS mdm
+    ON dam.driver_id = mdm.driver_id
+WHERE n.job_code = :job_code
+   AND n.occured_on >= CURRENT_TIMESTAMP AT TIME ZONE tm.mapped_timezone  - INTERVAL '1 minute' * :minutes
+         and n.occured_on <=  CURRENT_TIMESTAMP AT TIME ZONE tm.mapped_timezone       
+ORDER BY n.occured_on DESC
+         
+                    """),
+                    {"job_code": job_code, "minutes": minutes, "default_timezone": job_timezone, "start_time": start_time, "now": now}
+                ).fetchall()
+                
+                if results:
+                    df = pd.DataFrame([dict(r._mapping) for r in results])
+                    
+                    # if 'occured_on' in df.columns:
+                    #     df['occured_on'] = df['occured_on'].apply(
+                    #         lambda x: self._convert_rtc_to_job_timezone(x, job_code)
+                    #     )
+                    
+                    logger.info(f"✓ Fetched {len(df)} alerts for jobcode {job_code} ({job_timezone})")
+                    return df
+                else:
+                    logger.debug(f"No alerts found for jobcode {job_code}")
+                    return pd.DataFrame()
+                    
+        except Exception as error:
+            logger.error(f"Error fetching inserted alerts for jobcode {job_code}: {str(error)}")
+            return pd.DataFrame()
+
+    def _send_alert_email(self, job_code: str, df_alerts: pd.DataFrame, contact_details: dict) -> bool:
+        """Send alert email with inserted data - timezone aware"""
+        try:
+            if df_alerts.empty:
+                logger.warning(f"No alerts to send for jobcode {job_code}")
+                return False
+
+            def _split_emails(val):
+                if not val:
+                    return []
+                if isinstance(val, str):
+                    parts = [p.strip() for p in val.replace(',', ';').split(';')]
+                    valid_emails = [p for p in parts if p and p.lower() not in ('none', 'null', '') and '@' in p]
+                    return valid_emails
+                return []
+
+            email_to_list = []
+            # for key in ('pm_email', 'pnm_email', 'accountant_email', 'siteengineer_email'):
+            #     email_to_list.extend(_split_emails(contact_details.get(key)))
+
+            email_to_list = list(dict.fromkeys(email_to_list))
+
+            if not email_to_list:
+                email_to_list = ['Subham.Dey@ltimindtree.com']
+                logger.warning(f"No job contacts found for {job_code}; using fallback recipient")
+
+            email_cc_list = ['J.Saravanan@ltimindtree.com', 'jithin.g@ltimindtree.com', 
+                           'harichandana.geelapaturu@ltimindtree.com', 'Subham.Dey@ltimindtree.com']
+
+            df_alerts_copy = df_alerts.copy()
+            job_timezone = self._get_job_timezone_from_assets(job_code)
+            
+            if 'occured_on' in df_alerts_copy.columns:
+                df_alerts_copy['occured_on'] = pd.to_datetime(df_alerts_copy['occured_on']).dt.strftime('%d-%b-%Y %H:%M:%S')
+
+            df_alerts_display = df_alerts_copy.copy()
+            if 'deviceid' in df_alerts_display.columns:
+                df_alerts_display = df_alerts_display.drop(columns=['deviceid'])
+            if 'asset_time_zone' in df_alerts_display.columns:
+                df_alerts_display = df_alerts_display.drop(columns=['asset_time_zone'])
+
+            column_rename_map = {
+                'job_code': 'Job Code',
+                'job_desc': 'Job Description',
+                'asset_code': 'Asset Code',
+                'assettypename': 'Asset Type',
+                'vehicle_registration_no': 'Vehicle No',
+                'agency_name': 'Agency Name',
+                'drivername': 'Driver Name',
+                'phonenumber': 'Phone Number',
+                'occured_on': 'Event Timestamp',
+                'speed': 'Current Speed (km/h)',
+                'Safespeed': 'Safe Speed (km/h)',
+                'latitude': 'Latitude',
+                'longitude': 'Longitude',
+                'geofence_name': 'Geofence Name'
+            }
+            df_alerts_display = df_alerts_display.rename(columns=column_rename_map)
+
+            column_order = [
+                'Job Code',
+                'Job Description',
+                'Asset Code',
+                'Asset Type',
+                'Vehicle No',
+                'Agency Name',
+                'Driver Name',
+                'Phone Number',
+                'Event Timestamp',
+                'Current Speed (km/h)',
+                'Safe Speed (km/h)',
+                'Latitude',
+                'Longitude',
+                'Geofence Name'
+            ]
+            available_columns = [col for col in column_order if col in df_alerts_display.columns]
+            df_alerts_display = df_alerts_display[available_columns]
+
+            html_table = df_alerts_display.to_html(index=False, escape=False, border=1)
+
+            email_to_str = '; '.join(email_to_list)
+            email_cc_str = '; '.join(email_cc_list) if email_cc_list else ''
+
+            logger.info(f"Preparing email for jobcode {job_code} ({job_timezone}) -> To: {email_to_str}")
+
+            email_payload = {
+                "Username": self.email_username,
+                "Password": self.email_password,
+                "EmailTo": email_to_str,
+                "EMailCC": email_cc_str,
+                "EmailAttachments": [],
+                "EmailSubject": f"OverSpeed Alerts - {job_code} - {len(df_alerts)} Violations",
+                "EMailBody": f"""<html>
+            <head>
+                <style>
+                    body {{ font-family: Arial, sans-serif; font-size: 12px; }}
+                    table {{ border-collapse: collapse; width: 100%; margin: 10px 0; }}
+                    th {{ background-color: #4CAF50; color: white; padding: 10px; text-align: left; }}
+                    td {{ border: 1px solid #ddd; padding: 8px; }}
+                    tr:nth-child(even) {{ background-color: #f2f2f2; }}
+                </style>
+            </head>
+            <body>
+                <p>Dear Sir/Madam,</p>
+                <p>This is an automated alert notification from the IoT Safety System.</p>
+                <p><strong>Total Violations Detected: {len(df_alerts)}</strong></p>
+                
+                <p>Please find the asset details below which <strong style="color: red;">exceeded speed limits</strong>:</p>
+                {html_table}
+                <p>
+                    <strong>Alert Type Details:</strong><br>
+                    • <strong>Geofence Name:</strong> Indicates if alert is inside a geofence zone<br>
+                    • <strong>Current Speed:</strong> Vehicle speed in Km/Hr<br>
+                    • <strong>Safe Speed:</strong> Speed limit threshold in Km/Hr (125 for Renewable/LTSA IC, 60 for others)<br>
+                    • <strong>Asset Type:</strong> Type of vehicle/asset<br>
+                    • <strong>Agency Name:</strong> Driver/Agency information<br>
+                   
+                </p>
+                <p style="background-color: #fff3cd; padding: 10px; border-left: 4px solid #ffc107;">
+                    <strong>⚠ Action Required:</strong> Please review and take necessary action on the above violations.
+                </p>
+                <p>Thanks & Regards,<br><strong>Team - IoT Safety System</strong></p>
+            </body>
+            </html>""",
+                "Application": "AIS",
+                "ModuleName": "CVT-Fuel",
+                "Priority": 2
+            }
+
+            logger.info(f"Sending email for jobcode {job_code} to {len(email_to_list)} recipients...")
+            response = requests.post(self.email_api_url, json=email_payload, timeout=30)
+
+            if response.status_code == 200:
+                try:
+                    result = response.json()
+                except Exception:
+                    result = response.text
+                logger.info(f"✓ Email sent successfully for jobcode {job_code}: {result}")
+                return True
+            else:
+                logger.error(f"✗ Email API returned status {response.status_code} for jobcode {job_code}")
+                logger.error(f"Response: {response.text}")
+                return False
+
+        except requests.exceptions.Timeout:
+            logger.error(f"✗ Email API timeout for jobcode {job_code}")
+            return False
+        except requests.exceptions.RequestException as e:
+            logger.error(f"✗ Email request error for jobcode {job_code}: {str(e)}")
+            return False
+        except Exception as error:
+            logger.error(f"✗ Error sending email for jobcode {job_code}: {str(error)}")
+            return False
+
+    def _trigger_email_alerts(self, inserted_jobcodes: list = None, minutes: int = 30):
+        """Trigger emails for ALL jobcodes with recent alerts"""
+        try:
+            logger.info("\n" + "=" * 70)
+            logger.info("TRIGGERING EMAIL ALERTS")
+            logger.info("=" * 70)
+
+            try:
+                with self.prod_engine.connect() as conn:
+                    all_jobcodes_with_alerts = [
+                        row.job_code for row in conn.execute(
+                            text("""
+                                                   
+WITH timezone_mapping AS (
+    SELECT
+        a.jobcode,
+        a.asset_code,
+        CASE 
+            WHEN a.time_zone IS NULL 
+               OR a.time_zone = '' 
+                THEN 'Asia/Kolkata'
+            WHEN a.time_zone = 'Arabic Standard Time'
+                THEN 'Asia/Riyadh'
+            WHEN a.time_zone = 'Arabian Standard Time'
+                THEN 'Asia/Dubai'
+            ELSE 'Asia/Kolkata'
+        END AS mapped_timezone
+    FROM "Fuel_Prod".d_lntassetmaster a
+)
+SELECT DISTINCT
+    n.job_code
+FROM "Fuel_Prod".d_notification n
+LEFT JOIN timezone_mapping tm
+  ON tm.jobcode = n.job_code
+ AND tm.asset_code = n.asset_code
+WHERE n.occured_on >=
+        (CURRENT_TIMESTAMP AT TIME ZONE tm.mapped_timezone
+         - INTERVAL '1 minute' * :minutes)
+  AND n.occured_on <=
+        (CURRENT_TIMESTAMP AT TIME ZONE tm.mapped_timezone)
+  AND n.job_code IS NOT NULL
+ORDER BY n.job_code
+
+                            """),
+                            {"minutes": minutes}
+                        ).fetchall()
+                    ]
+            except Exception as query_error:
+                logger.warning(f"Error fetching jobcodes from d_notification: {str(query_error)}")
+                all_jobcodes_with_alerts = inserted_jobcodes if inserted_jobcodes else []
+
+            if not all_jobcodes_with_alerts:
+                logger.info("✗ No jobcodes with recent alerts found in d_notification")
+                return 0, 0
+
+            logger.info(f"✓ Found {len(all_jobcodes_with_alerts)} unique jobcodes with alerts in last {minutes} minutes")
+            
+            email_sent_count = 0
+            email_failed_count = 0
+
+            for job_code in all_jobcodes_with_alerts:
+                try:
+                    logger.info(f"\n→ Processing email for jobcode: {job_code}")
+
+                    contact_details = self._get_job_contact_details(job_code)
+                    if not contact_details:
+                        logger.warning(f"  ✗ Skipping email: No contact details found for {job_code}")
+                        email_failed_count += 1
+                        continue
+
+                    df_alerts = self._get_inserted_alerts_for_email(job_code, minutes=minutes)
+                    if df_alerts.empty:
+                        logger.warning(f"  ✗ Skipping email: No alerts found for {job_code} in last {minutes} minutes")
+                        email_failed_count += 1
+                        continue
+
+                    if 'geofence_name' not in df_alerts.columns:
+                        logger.debug("  ⚠ geofence_name column not present in alert data")
+                    
+                    if self._send_alert_email(job_code, df_alerts, contact_details):
+                        email_sent_count += 1
+                        logger.info(f"  ✓ Email sent for jobcode {job_code} ({len(df_alerts)} alerts)")
+                    else:
+                        email_failed_count += 1
+                        logger.warning(f"  ✗ Failed to send email for jobcode {job_code}")
+
+                except Exception as jobcode_error:
+                    logger.error(f"Error processing email for jobcode {job_code}: {str(jobcode_error)}")
+                    email_failed_count += 1
+                    continue
+
+            logger.info(f"\n✓ Email trigger completed: {email_sent_count} sent, {email_failed_count} failed")
+            return email_sent_count, email_failed_count
+
+        except Exception as error:
+            logger.error(f"Error in email trigger process: {str(error)}")
+            return 0, 0
+
+    def _insert_alerts_query(self):
+        """Optimized insert with duplicate check"""
+        return text("""
+    INSERT INTO "Fuel_Prod".d_notification (
+    job_code, asset_code, deviceid, occured_on, ignition,
+    latitude, longitude, speed, assettypename, geofence_name
+)
+SELECT
+    :job_code, :asset_code, :deviceid, :occured_on, :ignition,
+    :latitude, :longitude, :speed, :assettypename, :geofence_name       
+WHERE NOT EXISTS (
+    SELECT 1 FROM "Fuel_Prod".d_notification
+    WHERE deviceid = :deviceid
+      AND job_code = :job_code
+      AND asset_code = :asset_code
+      AND occured_on = :occured_on
+)
+        """)
+
+    def _prepare_alert_row(self, rmap, is_geofence: bool = False, geofence_name: str = 'N/A'):
+        """Prepare and convert alert row data with proper geofence_name"""
+        row_dict = {
+            'job_code': str(rmap.get('job_code') or '').strip(),
+            'asset_code': str(rmap.get('asset_code') or '').strip(),
+            'deviceid': str(rmap.get('deviceid') or '').strip(),
+            'occured_on': rmap.get('occurred_on'),
+            'ignition': int(rmap.get('ignition') or 0),
+            'latitude': str(rmap.get('latitude') or '0'),
+            'longitude': str(rmap.get('longitude') or '0'),
+            'speed': str(int(rmap.get('speed') or 0)),
+            'assettypename': str(rmap.get('assettypename') or '').strip(),
+            'geofence_name': str(geofence_name or 'N/A').strip() if geofence_name else 'N/A'
+        }
+        return row_dict
+
+    def _insert_single_alert(self, row_dict):
+        """Insert a single alert with its own transaction and error handling"""
+        try:
+            with self.prod_engine.begin() as conn:
+                result = conn.execute(self._insert_alerts_query(), row_dict)
+                if result.rowcount > 0:
+                    logger.debug(f"Inserted alert: Device {row_dict['deviceid']} | "
+                               f"Geofence: {row_dict['geofence_name']} | Speed: {row_dict['speed']}")
+                return result.rowcount > 0
+        except Exception as error:
+            logger.warning(f"Failed to insert alert for deviceid {row_dict['deviceid']}: {str(error)}")
+            return False
+
+    def process_speed_alerts(self, *, dry_run: bool = False, debug: bool = False):
+        """Process and transfer speed alerts from production"""
+        inserted_jobcodes = []
+        
+        try:
+            logger.info("\n" + "=" * 70)
+            logger.info("PROCESSING SPEED ALERTS")
+            logger.info("=" * 70)
+            
+            logger.info("Fetching speed alerts from PRODUCTION database...")
+            with self.prod_engine.connect() as src_conn:
+                query, params = self._get_speed_alerts_query()
+                results = src_conn.execute(query, params).fetchall()
+
+            if not results:
+                logger.info("✗ No new speed alerts to process")
+                return 0, 0, inserted_jobcodes
+
+            if results:
+                self.last_processed_time = max(row.occurred_on for row in results)
+                logger.info(f"✓ Updated last_processed_time to {self.last_processed_time}")
+
+            if debug:
+                sample = [dict(r._mapping) for r in results[:5]]
+                logger.debug(f"Sample speed alerts (first 5): {sample}")
+           
+            logger.info(f"✓ Found {len(results)} speed alerts")
+
+            if dry_run:
+                logger.info("Dry-run enabled: skipping inserts")
+                return len(results), 0, inserted_jobcodes
+
+            inserted_count = 0
+            skipped_count = 0
+           
+            for row in results:
+                rmap = row._mapping
+                
+                if (rmap.get('movementtype') or '').strip().lower() == 'stationary':
+                    skipped_count += 1
+                    logger.debug(f"Skipped stationary alert for deviceid {rmap.get('deviceid')}")
+                    continue
+                
+                row_dict = self._prepare_alert_row(rmap, is_geofence=False, geofence_name='N/A')
+                if self._insert_single_alert(row_dict):
+                    inserted_count += 1
+                    inserted_jobcodes.append(row_dict['job_code'])
+                else:
+                    skipped_count += 1
+           
+            logger.info(f"✓ Speed alerts: {inserted_count} inserted, {skipped_count} skipped")
+            return inserted_count, skipped_count, inserted_jobcodes
+
+        except Exception as error:
+            logger.error(f"Error in speed alert processing: {str(error)}")
+            raise
+
+    def process_geofence_alerts(self, *, dry_run: bool = False, debug: bool = False):
+        """Process and transfer geofence speed violations for ALL jobcodes"""
+        inserted_jobcodes = []
+        
+        try:
+            logger.info("\n" + "=" * 70)
+            logger.info("PROCESSING GEOFENCE ALERTS")
+            logger.info("=" * 70)
+            
+            logger.info("Fetching all unique jobcodes from d_lntassetmaster...")
+            with self.prod_engine.connect() as prod_conn:
+                all_jobcodes = [
+                    row.jobcode for row in prod_conn.execute(
+                        text("SELECT DISTINCT jobcode FROM \"Fuel_Prod\".d_lntassetmaster WHERE jobcode IS NOT NULL ORDER BY jobcode")
+                    ).fetchall()
+                ]
+
+            if not all_jobcodes:
+                logger.info("✗ No jobcodes found in d_lntassetmaster")
+                return 0, 0, inserted_jobcodes
+
+            logger.info(f"✓ Found {len(all_jobcodes)} unique jobcodes to process")
+
+            with self.prod_engine.connect() as prod_conn:
+                geofence_limits = {}
+                results = prod_conn.execute(text("""
+                    SELECT DISTINCT job_code, speed_limit
+                    FROM "Fuel_Prod".d_geo_fence
+                    WHERE is_active = TRUE
+                      AND lower(shape_type) = 'polygon'
+                      AND speed_limit IS NOT NULL
+                      AND job_code IN (SELECT DISTINCT jobcode FROM "Fuel_Prod".d_lntassetmaster)
+                """)).fetchall()
+                
+                for row in results:
+                    geofence_limits[row.job_code] = row.speed_limit
+
+            if not geofence_limits:
+                logger.info("✗ No active polygon geofences found for any jobcodes")
+                return 0, 0, inserted_jobcodes
+
+            logger.info(f"✓ Found {len(geofence_limits)} jobcodes with active geofence configurations")
+
+            total_inserted = 0
+            total_skipped = 0
+            
+            end_time = datetime.now()
+            start_time = end_time - timedelta(minutes=30)
+            
+            for jobcode, speed_limit in geofence_limits.items():
+                try:
+                    logger.info(f"\n→ Processing jobcode: {jobcode} (Speed Limit: {speed_limit} km/h)")
+                    
+                    geofence_name_map = self._get_geofence_names(jobcode)
+                    logger.info(f"  ✓ Found {len(geofence_name_map)} geofences for {jobcode}")
+                    
+                    if geofence_name_map:
+                        for gf_id, gf_name in list(geofence_name_map.items())[:3]:
+                            logger.debug(f"    - {gf_name} (ID: {gf_id})")
+                    
+                    with self.prod_engine.connect() as prod_conn:
+                        asset_codes = [
+                            row.asset_code for row in prod_conn.execute(
+                                text("SELECT DISTINCT asset_code FROM \"Fuel_Prod\".d_lntassetmaster WHERE jobcode = :jobcode"),
+                                {"jobcode": jobcode}
+                            ).fetchall()
+                        ]
+                    
+                    if not asset_codes:
+                        logger.debug(f"  ✗ No assets found for jobcode {jobcode}")
+                        continue
+
+                    logger.info(f"  ✓ Found {len(asset_codes)} assets")
+
+                    with self.prod_engine.connect() as prod_conn:
+                        results = prod_conn.execute(
+                            self._get_geofence_alerts_query(),
+                            {
+                                "jobcodes": [jobcode],
+                                "asset_codes": asset_codes,
+                                "start_time": start_time,
+                                "end_time": end_time,
+                               "speed_limit": speed_limit
+                            }
+                        ).fetchall()
+
+                    if not results:
+                        logger.debug(f"  ✗ No geofence violations for jobcode {jobcode}")
+                        continue
+
+                    logger.info(f"  ✓ Found {len(results)} potential violations")
+
+                    if debug:
+                        logger.debug(f"  Sample violations (first 3):")
+                        for sample in results[:3]:
+                            logger.debug(f"    Device: {sample.deviceid} | Speed: {sample.speed}")
+
+                    if dry_run:
+                        logger.info(f"  Dry-run: Would insert {len(results)} alerts for {jobcode}")
+                        total_inserted += len(results)
+                        continue
+
+                    inserted_count = 0
+                    skipped_count = 0
+
+                    for row in results:
+                        rmap = row._mapping
+                        
+                        geofence_name_from_report = str(rmap.get('geofence_name') or '').strip()
+                        
+                        if geofence_name_from_report and geofence_name_from_report != 'N/A':
+                            geofence_name = geofence_name_from_report
+                        elif geofence_name_map:
+                            geofence_name = list(geofence_name_map.values())[0]
+                        else:
+                            geofence_name = 'N/A'
+                        
+                        row_dict = self._prepare_alert_row(rmap, is_geofence=True, geofence_name=geofence_name)
+                        
+                        if self._insert_single_alert(row_dict):
+                            inserted_count += 1
+                            inserted_jobcodes.append(row_dict['job_code'])
+                        else:
+                            skipped_count += 1
+
+                    total_inserted += inserted_count
+                    total_skipped += skipped_count
+                    
+                    if inserted_count > 0:
+                        logger.info(f"  ✓ Geofence {jobcode}: {inserted_count} inserted, {skipped_count} skipped")
+                    
+                except Exception as jobcode_error:
+                    logger.warning(f"Error processing geofence for jobcode {jobcode}: {str(jobcode_error)}")
+                    continue
+
+            logger.info(f"\n✓ Total geofence alerts: {total_inserted} inserted, {total_skipped} skipped")
+            return total_inserted, total_skipped, inserted_jobcodes
+
+        except Exception as error:
+            logger.error(f"Error in geofence alert processing: {str(error)}")
+            raise
+
+    def verify_inserted_data(self):
+        """Comprehensive verification of inserted data in production database"""
+        try:
+            logger.info("\n" + "=" * 70)
+            logger.info("VERIFYING INSERTED DATA IN PRODUCTION DATABASE")
+            logger.info("=" * 70)
+            
+            with self.prod_engine.connect() as conn:
+                total_count = conn.execute(
+                    text("SELECT COUNT(*) FROM \"Fuel_Prod\".d_notification")
+                ).scalar()
+                logger.info(f"✓ Total records in d_notification: {total_count}")
+                
+                today_count = conn.execute(
+                    text("""
+                    SELECT COUNT(*) FROM "Fuel_Prod".d_notification 
+                    WHERE DATE(occured_on) = CURRENT_DATE
+                    """)
+                ).scalar()
+                logger.info(f"✓ Records inserted today: {today_count}")
+                
+                last_hour_count = conn.execute(
+                    text("""
+                    SELECT COUNT(*) FROM "Fuel_Prod".d_notification 
+                    WHERE occured_on >= NOW() - INTERVAL '1 hour'
+                    """)
+                ).scalar()
+                logger.info(f"✓ Records from last 1 hour: {last_hour_count}")
+                
+                logger.info("\n--- LATEST 10 INSERTED RECORDS ---")
+                latest_records = conn.execute(
+                    text("""
+                    SELECT deviceid, job_code, asset_code, occured_on, ignition, 
+                           latitude, longitude, speed, assettypename, geofence_name
+                    FROM "Fuel_Prod".d_notification 
+                    ORDER BY occured_on DESC 
+                    LIMIT 10
+                    """)
+                ).fetchall()
+                
+                for i, record in enumerate(latest_records, 1):
+                    logger.info(f"{i}. Device: {record.deviceid} | Job: {record.job_code} | "
+                              f"Geofence: {record.geofence_name} | Speed: {record.speed} | "
+                              f"Time: {record.occured_on}")
+                
+                logger.info("\n--- ALERT BREAKDOWN ---")
+                geofence_count = conn.execute(
+                    text("""
+                    SELECT COUNT(*) FROM "Fuel_Prod".d_notification 
+                    WHERE geofence_name != 'N/A' AND DATE(occured_on) = CURRENT_DATE
+                    """)
+                ).scalar()
+                
+                speed_count = conn.execute(
+                    text("""
+                    SELECT COUNT(*) FROM "Fuel_Prod".d_notification 
+                    WHERE geofence_name = 'N/A' AND DATE(occured_on) = CURRENT_DATE
+                    """)
+                ).scalar()
+                
+                logger.info(f"✓ Geofence alerts (today): {geofence_count}")
+                logger.info(f"✓ Speed alerts (today): {speed_count}")
+                
+                logger.info("\n--- UNIQUE GEOFENCES IN TODAY'S DATA ---")
+                geofences = conn.execute(
+                    text("""
+                    SELECT DISTINCT geofence_name, COUNT(*) as count
+                    FROM "Fuel_Prod".d_notification 
+                    WHERE DATE(occured_on) = CURRENT_DATE AND geofence_name != 'N/A'
+                    GROUP BY geofence_name
+                    ORDER BY count DESC
+                    """)
+                ).fetchall()
+                
+                if geofences:
+                    for gf in geofences:
+                        logger.info(f"  ✓ {gf.geofence_name}: {gf.count} records")
+                else:
+                    logger.info("  ✗ No geofence data found")
+                
+                logger.info("\n" + "=" * 70)
+                return {
+                    'total_count': total_count,
+                    'today_count': today_count,
+                    'last_hour_count': last_hour_count,
+                    'geofence_count': geofence_count,
+                    'speed_count': speed_count,
+                    'latest_records': latest_records
+                }
+                
+        except Exception as error:
+            logger.error(f"Error verifying data: {str(error)}")
+            raise
+
+    def process_all_alerts(self, *, dry_run: bool = False, debug: bool = False, send_emails: bool = True):
+        """Process both speed and geofence alerts in single execution"""
+        logger.info("=" * 70)
+        logger.info("STARTING UNIFIED ALERT PROCESSING CYCLE")
+        logger.info("=" * 70)
+        
+        try:
+            self._cache_all_job_timezones()
+            
+            speed_inserted, speed_skipped, speed_jobcodes = self.process_speed_alerts(
+                dry_run=dry_run, debug=debug
+            )
+            geofence_inserted, geofence_skipped, geofence_jobcodes = self.process_geofence_alerts(
+                dry_run=dry_run, debug=debug
+            )
+            
+            total_inserted = speed_inserted + geofence_inserted
+            total_skipped = speed_skipped + geofence_skipped
+            
+            logger.info("\n" + "=" * 70)
+            logger.info("FINAL SUMMARY")
+            logger.info("=" * 70)
+            logger.info(f"Speed Alerts:    {speed_inserted} inserted | {speed_skipped} skipped")
+            logger.info(f"Geofence Alerts: {geofence_inserted} inserted | {geofence_skipped} skipped")
+            logger.info(f"TOTAL:           {total_inserted} inserted | {total_skipped} skipped")
+            logger.info(f"Timezone Cache:  {len(self.timezone_cache)} jobs cached")
+            logger.info("=" * 70)
+            
+            if send_emails and not dry_run:
+                email_sent, email_failed = self._trigger_email_alerts(minutes=30)
+                logger.info(f"Email Summary: {email_sent} sent | {email_failed} failed")
+            
+            return total_inserted, total_skipped
+            
+        except Exception as error:
+            logger.error(f"Critical error in alert processing: {str(error)}")
+            raise
+
+
+def main():
+    """Main entry point"""
+    dev_config = DatabaseConfig(
+        env_name="Development",
+        username="citus",
+        password="C4#oB@1dbGC)p&h",
+        hostname="c-bikefuelcitus.wt76joutcg5jiv.postgres.cosmos.azure.com",
+    )
+
+    prod_config = DatabaseConfig(
+        env_name="Production",
+        username="citus",
+        password="rb4a9!xTK&@R*",
+        hostname="c.bikefuelcitusdb.postgres.database.azure.com",
+    )
+
+    alert_system = AlertSystem(dev_config, prod_config)
+
+    try:
+        logger.info("Testing database connections...")
+        alert_system.test_connections()
+
+        logger.info("Starting alert processing cycle...")
+        total_inserted, total_skipped = alert_system.process_all_alerts(
+            debug=False,
+            send_emails=True
+        )
+        
+        verification_result = alert_system.verify_inserted_data()
+
+    except Exception as e:
+        logger.error(f"Critical failure: {str(e)}")
+        raise
+
+
+if __name__ == "__main__":
+    main()
