@@ -1,0 +1,321 @@
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Drain Detection Algorithm — Plateau-Based (mirrors refuel detection)
+    //
+    //  Design principles (same as AnalyzeFuelData but for DROPS):
+    //  1.  Find STABLE LEVELS (plateaus), then compare consecutive plateaus.
+    //      A drain is: plateau_before − plateau_after ≥ threshold.
+    //  2.  A "plateau" is a contiguous window where max−min ≤ stabilityBand,
+    //      lasting ≥ minPlateauSec seconds with ≥ minPlateauRecords records.
+    //  3.  Median-3 smoothing is used only for spike rejection when finding
+    //      plateaus. Raw fuel values are used for reporting.
+    //  4.  Post-drain recovery check: if fuel returns near the pre-drain
+    //      level within 20 minutes → undulation / sensor noise, SKIP.
+    //  5.  If fuel does NOT recover → confirmed DRAIN.
+    //  6.  Refuel events (fuel going UP) are naturally skipped since we only
+    //      look for drops between plateaus.
+    //  7.  Step-wise drains (106→95→85→75) are handled by comparing
+    //      non-consecutive plateaus where intermediates are all non-increasing.
+    // ─────────────────────────────────────────────────────────────────────────
+    static List<(DateTime StartTime, DateTime EndTime, double StartLevel, double EndLevel, double DrainQuantity)>
+        DetectFuelDrainEvents(List<FuelRecord> records)
+    {
+        var drainEvents = new List<(DateTime, DateTime, double, double, double)>();
+
+        if (records == null || records.Count < 3)
+            return drainEvents;
+
+        var recs = records
+            .Where(r => r.FuelLevel > 0 && r.Rtc != DateTime.MinValue)
+            .OrderBy(r => r.Rtc)
+            .ToList();
+
+        if (recs.Count < 3)
+            return drainEvents;
+
+        int n = recs.Count;
+
+        // ── Median-3 smoothing to remove single-sample sensor spikes ──
+        var sm = new double[n];
+        for (int s = 0; s < n; s++)
+        {
+            int lo = Math.Max(0, s - 1);
+            int hi = Math.Min(n - 1, s + 1);
+            double a = recs[lo].FuelLevel, b = recs[s].FuelLevel, c = recs[hi].FuelLevel;
+            sm[s] = a < b ? (b < c ? b : (a < c ? c : a))
+                          : (a < c ? a : (b < c ? c : b));
+        }
+
+        // ── Thresholds ──
+        const double minDrainLitres    = 5.0;    // minimum drop to flag as drain (L)
+        const double stabilityBand     = 3.0;    // max fuel swing within a plateau (L)
+        const int    minPlateauSec     = 30;     // minimum plateau duration (seconds)
+        const int    minPlateauRecords = 2;      // minimum records in a plateau
+        const int    postDrainCheckSec = 1200;   // 20-min window to check for recovery
+        const double recoveryNearL     = 10.0;   // if fuel returns within this of start level → undulation
+
+        // ═══════════════════════════════════════════════════════════════════════
+        //  STEP 1: Identify all stable plateaus
+        //  A plateau is the longest contiguous run starting at index pi where
+        //  max(sm) − min(sm) ≤ stabilityBand.
+        // ═══════════════════════════════════════════════════════════════════════
+        var plateaus = new List<(int startIdx, int endIdx, double level)>();
+        int pi = 0;
+        while (pi < n)
+        {
+            double pMin = sm[pi], pMax = sm[pi];
+            int pEnd = pi;
+
+            for (int k = pi + 1; k < n; k++)
+            {
+                double newMin = Math.Min(pMin, sm[k]);
+                double newMax = Math.Max(pMax, sm[k]);
+                if (newMax - newMin > stabilityBand) break;
+                pMin = newMin;
+                pMax = newMax;
+                pEnd = k;
+            }
+
+            double durationSec = (recs[pEnd].Rtc - recs[pi].Rtc).TotalSeconds;
+            int recordCount = pEnd - pi + 1;
+
+            if (durationSec >= minPlateauSec && recordCount >= minPlateauRecords)
+            {
+                var rawVals = new List<double>(recordCount);
+                for (int k = pi; k <= pEnd; k++)
+                    rawVals.Add(recs[k].FuelLevel);
+                rawVals.Sort();
+                double medianLevel = rawVals[rawVals.Count / 2];
+
+                plateaus.Add((pi, pEnd, medianLevel));
+                pi = pEnd + 1;
+            }
+            else
+            {
+                pi++;
+            }
+        }
+
+        if (plateaus.Count < 2)
+            return drainEvents;
+
+        Console.WriteLine($"[Drain] Found {plateaus.Count} stable plateaus");
+
+        var detectedEvents = new List<(DateTime start, DateTime end)>();
+
+        // ═══════════════════════════════════════════════════════════════════════
+        //  STEP 2: Compare consecutive plateaus for significant DROPS
+        //  If plateau_before.level − plateau_after.level ≥ minDrainLitres,
+        //  and fuel doesn't recover to near the pre-drain level within 20 min
+        //  after the drain → confirmed drain.
+        // ═══════════════════════════════════════════════════════════════════════
+        for (int p = 0; p < plateaus.Count - 1; p++)
+        {
+            var platBefore = plateaus[p];
+            var platAfter = plateaus[p + 1];
+
+            double drop = platBefore.level - platAfter.level;
+
+            // Skip rises (refuel) or insignificant drops
+            if (drop < minDrainLitres)
+                continue;
+
+            // Find raw start level: highest fuel in the "before" plateau
+            int startIdx = platBefore.startIdx;
+            double startLevel = recs[platBefore.startIdx].FuelLevel;
+            for (int k = platBefore.startIdx + 1; k <= platBefore.endIdx; k++)
+            {
+                if (recs[k].FuelLevel > startLevel)
+                {
+                    startLevel = recs[k].FuelLevel;
+                    startIdx = k;
+                }
+            }
+
+            // Find raw end level: lowest fuel in the "after" plateau
+            int endIdx = platAfter.startIdx;
+            double endLevel = recs[platAfter.startIdx].FuelLevel;
+            for (int k = platAfter.startIdx + 1; k <= platAfter.endIdx; k++)
+            {
+                if (recs[k].FuelLevel < endLevel)
+                {
+                    endLevel = recs[k].FuelLevel;
+                    endIdx = k;
+                }
+            }
+
+            double rawDrain = startLevel - endLevel;
+            if (rawDrain < minDrainLitres)
+                continue;
+
+            // Skip if overlaps an already-detected event
+            bool overlap = false;
+            foreach (var (ds, de) in detectedEvents)
+            {
+                if (recs[startIdx].Rtc <= de && recs[endIdx].Rtc >= ds)
+                { overlap = true; break; }
+            }
+            if (overlap) continue;
+
+            // ── Post-drain recovery check ──
+            // After the drain, within 20 minutes, does fuel come back near
+            // the starting level? If so → undulation / sensor noise, skip.
+            bool recovered = false;
+            for (int k = endIdx + 1; k < n; k++)
+            {
+                if ((recs[k].Rtc - recs[endIdx].Rtc).TotalSeconds > postDrainCheckSec)
+                    break;
+
+                if (Math.Abs(recs[k].FuelLevel - startLevel) <= recoveryNearL)
+                {
+                    recovered = true;
+                    Console.WriteLine(
+                        $"[SKIP-Recovered] {recs[startIdx].Rtc:HH:mm:ss} -> {recs[endIdx].Rtc:HH:mm:ss} " +
+                        $"Drop={rawDrain:F2}L but fuel recovered to {recs[k].FuelLevel:F2}L " +
+                        $"(near start {startLevel:F2}L) at {recs[k].Rtc:HH:mm:ss} => undulation");
+                    break;
+                }
+            }
+
+            if (recovered)
+                continue;
+
+            // Confirmed drain
+            drainEvents.Add((recs[startIdx].Rtc, recs[endIdx].Rtc, startLevel, endLevel, rawDrain));
+            detectedEvents.Add((recs[startIdx].Rtc, recs[endIdx].Rtc));
+
+            Console.WriteLine(
+                $"[DRAIN] {recs[startIdx].Rtc:yyyy-MM-dd HH:mm:ss} -> {recs[endIdx].Rtc:yyyy-MM-dd HH:mm:ss} | " +
+                $"Level: {startLevel:F2}L -> {endLevel:F2}L | Drained={rawDrain:F2}L");
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        //  STEP 3: Step-wise drain detection (non-consecutive plateaus)
+        //  Handles drains in steps: 106→95→85→75
+        //  Each individual step may be < threshold, but total drop is significant.
+        //  All intermediate plateaus must be non-increasing (staircase down).
+        // ═══════════════════════════════════════════════════════════════════════
+        const int stepwiseMaxMinutes = 30;
+
+        for (int pStart = 0; pStart < plateaus.Count - 2; pStart++)
+        {
+            var startPlat = plateaus[pStart];
+
+            // Skip if already covered by a detected event
+            bool alreadyCovered = false;
+            foreach (var (ds, de) in detectedEvents)
+            {
+                if (recs[startPlat.startIdx].Rtc <= de && recs[startPlat.endIdx].Rtc >= ds)
+                { alreadyCovered = true; break; }
+            }
+            if (alreadyCovered) continue;
+
+            int bestEnd = -1;
+            double bestDrain = 0;
+
+            for (int pEnd2 = pStart + 2; pEnd2 < plateaus.Count; pEnd2++)
+            {
+                var endPlat = plateaus[pEnd2];
+
+                double spanMin = (recs[endPlat.startIdx].Rtc - recs[startPlat.endIdx].Rtc).TotalMinutes;
+                if (spanMin > stepwiseMaxMinutes) break;
+
+                double totalDrop = startPlat.level - endPlat.level;
+                if (totalDrop < minDrainLitres) continue;
+
+                // Ensure all intermediate plateaus are non-increasing
+                bool nonIncreasing = true;
+                double prevLevel = startPlat.level;
+                for (int pm = pStart + 1; pm < pEnd2; pm++)
+                {
+                    if (plateaus[pm].level > prevLevel + 1.0)
+                    { nonIncreasing = false; break; }
+                    prevLevel = plateaus[pm].level;
+                }
+                if (!nonIncreasing) continue;
+
+                if (totalDrop > bestDrain)
+                {
+                    bestDrain = totalDrop;
+                    bestEnd = pEnd2;
+                }
+            }
+
+            if (bestEnd < 0) continue;
+
+            // Dominance check: if one step accounts for >80% of total,
+            // it was already caught in consecutive comparison (Step 2)
+            {
+                double maxSingleStep = 0;
+                double prevLev = startPlat.level;
+                for (int pm = pStart + 1; pm <= bestEnd; pm++)
+                {
+                    double stepDrop = prevLev - plateaus[pm].level;
+                    if (stepDrop > maxSingleStep) maxSingleStep = stepDrop;
+                    prevLev = plateaus[pm].level;
+                }
+                if (maxSingleStep > bestDrain * 0.80)
+                    continue;
+            }
+
+            var endPlatBest = plateaus[bestEnd];
+
+            // Find raw start level: highest in start plateau
+            int rawStartIdx = startPlat.startIdx;
+            double rawStartLevel = recs[startPlat.startIdx].FuelLevel;
+            for (int k = startPlat.startIdx + 1; k <= startPlat.endIdx; k++)
+            {
+                if (recs[k].FuelLevel > rawStartLevel)
+                { rawStartLevel = recs[k].FuelLevel; rawStartIdx = k; }
+            }
+
+            // Find raw end level: lowest in end plateau
+            int rawEndIdx = endPlatBest.startIdx;
+            double rawEndLevel = recs[endPlatBest.startIdx].FuelLevel;
+            for (int k = endPlatBest.startIdx + 1; k <= endPlatBest.endIdx; k++)
+            {
+                if (recs[k].FuelLevel < rawEndLevel)
+                { rawEndLevel = recs[k].FuelLevel; rawEndIdx = k; }
+            }
+
+            double swRawDrain = rawStartLevel - rawEndLevel;
+            if (swRawDrain < minDrainLitres) continue;
+
+            // Skip if overlaps
+            bool swOverlap = false;
+            foreach (var (ds, de) in detectedEvents)
+            {
+                if (recs[rawStartIdx].Rtc <= de && recs[rawEndIdx].Rtc >= ds)
+                { swOverlap = true; break; }
+            }
+            if (swOverlap) continue;
+
+            // Post-drain recovery check
+            bool swRecovered = false;
+            for (int k = rawEndIdx + 1; k < n; k++)
+            {
+                if ((recs[k].Rtc - recs[rawEndIdx].Rtc).TotalSeconds > postDrainCheckSec) break;
+                if (Math.Abs(recs[k].FuelLevel - rawStartLevel) <= recoveryNearL)
+                {
+                    swRecovered = true;
+                    Console.WriteLine(
+                        $"[SKIP-Recovered-StepWise] {recs[rawStartIdx].Rtc:HH:mm:ss} -> {recs[rawEndIdx].Rtc:HH:mm:ss} " +
+                        $"Drop={swRawDrain:F2}L but fuel recovered => undulation");
+                    break;
+                }
+            }
+            if (swRecovered) continue;
+
+            drainEvents.Add((recs[rawStartIdx].Rtc, recs[rawEndIdx].Rtc, rawStartLevel, rawEndLevel, swRawDrain));
+            detectedEvents.Add((recs[rawStartIdx].Rtc, recs[rawEndIdx].Rtc));
+
+            Console.WriteLine(
+                $"[DRAIN-StepWise] {recs[rawStartIdx].Rtc:yyyy-MM-dd HH:mm:ss} -> {recs[rawEndIdx].Rtc:yyyy-MM-dd HH:mm:ss} | " +
+                $"Level: {rawStartLevel:F2}L -> {rawEndLevel:F2}L | Drained={swRawDrain:F2}L");
+        }
+
+        // Sort by start time
+        drainEvents.Sort((a, b) => a.StartTime.CompareTo(b.StartTime));
+
+        return drainEvents;
+    }
+

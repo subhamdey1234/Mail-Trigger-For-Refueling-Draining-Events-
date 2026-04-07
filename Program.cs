@@ -98,6 +98,7 @@ class FuelRecord
     public double Latitude;
     public double Longitude;
     public double Speed;
+    public double Tag627;
     public string? AssetTypeName;
 
 }
@@ -196,7 +197,7 @@ class Program
 
                         foreach (var assetCode in specificAssetCodes)
                         {
-                            if (!TryGetDeviceId(appSettings.ConnectionStrings.CitusDb, assetCode, out int deviceId, out string? jobCode))
+                            if (!TryGetDeviceId(appSettings.ConnectionStrings.CitusDb, assetCode, out int deviceId, out string? jobCode, out _))
                                 continue;
 
                             var records = FetchFuelRecords(appSettings.ConnectionStrings.CitusDb, deviceId, mode2Start, mode2End);
@@ -251,8 +252,12 @@ class Program
                     await RunMode5DrainDetection(appSettings);
                     break;
 
+                case "6":
+                    RunDrainSearchMode(appSettings);
+                    break;
+
                 default:
-                    Console.WriteLine("Invalid mode. Please specify 1, 2, 3, 4, or 5.");
+                    Console.WriteLine("Invalid mode. Please specify 1, 2, 3, 4, 5, or 6.");
                     break;
             }
         }
@@ -275,28 +280,177 @@ class Program
     }
 
     // Fixing nullable issue in TryGetDeviceId method
-    static bool TryGetDeviceId(string connString, string assetCode, out int deviceId, out string? jobCode)
+    static bool TryGetDeviceId(string connString, string assetCode, out int deviceId, out string? jobCode, out string? movementType)
     {
         deviceId = 0;
         jobCode = null;
+        movementType = null;
         using var conn = new NpgsqlConnection(connString);
         conn.Open();
-        using var cmd = new NpgsqlCommand("SELECT platform_asset_id, jobcode FROM \"Fuel_Prod\".d_lntassetmaster WHERE asset_code = @assetCode", conn);
+        using var cmd = new NpgsqlCommand("SELECT platform_asset_id, jobcode, movementtype FROM \"Fuel_Prod\".d_lntassetmaster WHERE asset_code = @assetCode", conn);
         cmd.Parameters.AddWithValue("assetCode", assetCode);
         using var reader = cmd.ExecuteReader();
         if (reader.Read())
         {
             deviceId = reader.GetInt32(0);
-            jobCode = reader.IsDBNull(1) ? "Unknown Job Code" : reader.GetString(1); // Ensure jobCode is never null
+            jobCode = reader.IsDBNull(1) ? "Unknown Job Code" : reader.GetString(1);
+            movementType = reader.IsDBNull(2) ? null : reader.GetString(2);
             return true;
         }
         return false;
+    }
+
+    // Helper: classify movementtype values into "Stationary" or "Mobile"
+    static bool IsStationaryAsset(string? movementType)
+    {
+        if (string.IsNullOrWhiteSpace(movementType))
+            return false; // default to Mobile (lower threshold = stricter)
+
+        var mt = movementType.Trim().ToUpperInvariant();
+        // Stationary: "Stationary", "stationary", "YES"
+        // Mobile: "Mobile", "mobile", "MOBILE", "NO", "1"
+        return mt == "STATIONARY" || mt == "YES" || mt=="1";
     }
 
 
 
 
     // Call the existing function
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  MODE 6: Drain Search Mode — interactive testing mode for drain detection
+    //  Accepts comma-separated asset codes via console input and displays
+    //  detected drain events in a console table (similar to Mode 3 for refueling).
+    // ═══════════════════════════════════════════════════════════════════════════
+    static void RunDrainSearchMode(AppSettings? appSettings)
+    {
+        if (appSettings == null || string.IsNullOrEmpty(appSettings.ConnectionStrings?.CitusDb))
+        {
+            Console.WriteLine("[Mode 6] Database connection string is missing in appsettings.");
+            return;
+        }
+
+        string connString = appSettings.ConnectionStrings.CitusDb!;
+
+        string? defaultAssets = appSettings.TestData?.AssetCodes != null && appSettings.TestData.AssetCodes.Count > 0
+            ? string.Join(",", appSettings.TestData.AssetCodes)
+            : null;
+
+        Console.Write($"Enter asset codes (comma-separated, e.g. 40550JYH,LTPP40677549H){(defaultAssets != null ? $" [default: from appsettings]" : "")}: ");
+        string? assetInput = Console.ReadLine()?.Trim();
+
+        List<string> assetCodes;
+        if (string.IsNullOrEmpty(assetInput))
+        {
+            if (appSettings.TestData?.AssetCodes != null && appSettings.TestData.AssetCodes.Count > 0)
+            {
+                assetCodes = appSettings.TestData.AssetCodes;
+            }
+            else
+            {
+                Console.WriteLine("Asset codes are required.");
+                return;
+            }
+        }
+        else
+        {
+            assetCodes = assetInput.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+        }
+
+        if (assetCodes.Count == 0)
+        {
+            Console.WriteLine("No valid asset codes provided.");
+            return;
+        }
+
+        Console.WriteLine($"Total asset codes to process: {assetCodes.Count}");
+
+        string? startStr = appSettings.TestData?.StartTime;
+        string? endStr = appSettings.TestData?.EndTime;
+
+        if (string.IsNullOrWhiteSpace(startStr))
+        {
+            Console.Write("Enter start time (yyyy-MM-dd HH:mm:ss): ");
+            startStr = Console.ReadLine()?.Trim();
+        }
+        else
+        {
+            Console.WriteLine($"Using start time from appsettings: {startStr}");
+        }
+
+        if (string.IsNullOrWhiteSpace(endStr))
+        {
+            Console.Write("Enter end time (yyyy-MM-dd HH:mm:ss): ");
+            endStr = Console.ReadLine()?.Trim();
+        }
+        else
+        {
+            Console.WriteLine($"Using end time from appsettings: {endStr}");
+        }
+
+        if (!DateTime.TryParseExact(startStr, "yyyy-MM-dd HH:mm:ss", null, DateTimeStyles.None, out DateTime startTime))
+        {
+            Console.WriteLine("Invalid start time format. Use yyyy-MM-dd HH:mm:ss");
+            return;
+        }
+
+        if (!DateTime.TryParseExact(endStr, "yyyy-MM-dd HH:mm:ss", null, DateTimeStyles.None, out DateTime endTime))
+        {
+            Console.WriteLine("Invalid end time format. Use yyyy-MM-dd HH:mm:ss");
+            return;
+        }
+
+        foreach (var assetCode in assetCodes)
+        {
+            SearchAssetCodeAndDisplayDrainData(connString, assetCode, startTime, endTime);
+        }
+    }
+
+    static void SearchAssetCodeAndDisplayDrainData(string connString, string assetCode, DateTime startTime, DateTime endTime)
+    {
+        Console.WriteLine($"\n--- Searching Drain Events for AssetCode: {assetCode} ---");
+
+        if (!TryGetDeviceId(connString, assetCode, out int deviceId, out string? jobCode, out string? movementType))
+        {
+            Console.WriteLine($"No device found for asset code {assetCode}.");
+            return;
+        }
+
+        jobCode ??= "Unknown Job Code";
+
+        var records = FetchFuelRecords(connString, deviceId, startTime, endTime);
+        Console.WriteLine($"Fetched {records.Count} records for asset code {assetCode}.");
+        if (records.Count == 0)
+        {
+            Console.WriteLine($"No records found for asset code {assetCode}.");
+            return;
+        }
+
+        Console.WriteLine($"Device ID: {deviceId}");
+        Console.WriteLine($"Job Code: {jobCode}");
+        Console.WriteLine($"Movement Type: {movementType ?? "Unknown"}");
+        Console.WriteLine("------------------------------------------------------------------------------------------------------------------------------");
+        Console.WriteLine($"| {"Drain Start Time",-20} | {"Drain End Time",-20} | {"Start Level(L)",-15} | {"End Level(L)",-13} | {"Drain Qty(L)",-13} | {"Duration(min)",-14} |");
+        Console.WriteLine("------------------------------------------------------------------------------------------------------------------------------");
+
+        var drainEvents = DetectFuelDrainEvents(records, endTime, movementType);
+
+        if (drainEvents.Count == 0)
+        {
+            Console.WriteLine($"No drain events detected for asset code {assetCode}.");
+        }
+        else
+        {
+            foreach (var drain in drainEvents)
+            {
+                double durationMin = (drain.EndTime - drain.StartTime).TotalMinutes;
+                Console.WriteLine($"| {drain.StartTime:yyyy-MM-dd HH:mm:ss,-20} | {drain.EndTime:yyyy-MM-dd HH:mm:ss,-20} | {drain.StartLevel,-15:F2} | {drain.EndLevel,-13:F2} | {drain.DrainQuantity,-13:F2} | {durationMin,-14:F1} |");
+            }
+            Console.WriteLine("------------------------------------------------------------------------------------------------------------------------------");
+            Console.WriteLine($"Total Drain Events: {drainEvents.Count}");
+            Console.WriteLine($"Total Drained: {drainEvents.Sum(d => d.DrainQuantity):F2} L");
+        }
+    }
+
     static void RunSearchMode(AppSettings? appSettings)
     {
         if (appSettings == null || string.IsNullOrEmpty(appSettings.ConnectionStrings?.CitusDb))
@@ -436,7 +590,7 @@ class Program
 
         foreach (var assetCode in assetCodes)
         {
-            if (!TryGetDeviceId(appSettings.ConnectionStrings.CitusDb, assetCode, out int deviceId, out string? jobCode))
+            if (!TryGetDeviceId(appSettings.ConnectionStrings.CitusDb, assetCode, out int deviceId, out string? jobCode, out _))
                 continue;
 
             var records = FetchFuelRecords(appSettings.ConnectionStrings.CitusDb, deviceId, mode4Start, mode4End);
@@ -516,10 +670,10 @@ class Program
             return;
         }
 
-        var assetCodes = GetAssetCodesForSbgAndIc(appSettings.ConnectionStrings.CitusDb);
+        var assetCodes = LoadAssetCodesFromDatabase(appSettings.ConnectionStrings.CitusDb);
         if (assetCodes.Count == 0)
         {
-            Console.WriteLine("[Mode 5] No asset codes found for the specified SBG + IC filter.");
+            Console.WriteLine("[Mode 5] No asset codes found in the database.");
             return;
         }
 
@@ -547,7 +701,7 @@ class Program
 
         foreach (var assetCode in assetCodes)
         {
-            if (!TryGetDeviceId(appSettings.ConnectionStrings.CitusDb, assetCode, out int deviceId, out string? jobCode))
+            if (!TryGetDeviceId(appSettings.ConnectionStrings.CitusDb, assetCode, out int deviceId, out string? jobCode, out string? movementType))
                 continue;
 
             var records = FetchFuelRecords(appSettings.ConnectionStrings.CitusDb, deviceId, startTime, endTime);
@@ -558,7 +712,7 @@ class Program
                 continue;
             }
 
-            var drainEvents = DetectFuelDrainEvents(records);
+            var drainEvents = DetectFuelDrainEvents(records, endTime, movementType);
 
             foreach (var drain in drainEvents)
             {
@@ -612,27 +766,489 @@ class Program
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  Drain Detection Algorithm
+    //  Drain Detection Algorithm — 3 Scenarios
     //
-    //  Sliding window: 5 to 10 minutes.
-    //  Threshold: fuel drops > 10 L within window → drain.
-    //  Undulation filter: median-3 smoothing removes single-sample sensor spikes.
-    //  Normal consumption filter: gradual decrease (small per-step drops spread
-    //      across the window) is NOT flagged. Only a SUDDEN sharp drop is flagged.
-    //      "Sudden" = the largest single-step drop (or sum of 2 consecutive steps)
-    //      accounts for >60 % of the total window decrease.
+    //  Scenario 1 (Quick drain):
+    //    Fuel decreases within 5 min. The next 10–20 records never come back
+    //    close (within 1 L) to the initial level → confirmed drain (>5 L).
+    //
+    //  Scenario 2 (Zigzag drain):
+    //    Fuel goes ↓↑↓↑↓ (oscillating decrease-increase pattern). After the
+    //    zigzag, level never recovers to initial point → net loss >5 L = drain.
+    //
+    //  Scenario 3 (Long-period drain with small spikes):
+    //    Fuel decreases over a long period with small spikes in between, then
+    //    a big final decrease. During the long period speed (tag_388) must be
+    //    ≤ 1. If the last point does not recover near the starting point → drain.
+    //
+    //  False-event filter (all scenarios):
+    //    If ANY of the next 20 records after the drain endpoint comes within
+    //    1 L of the initial (pre-drain) fuel level, the event is considered
+    //    a false event / sensor noise and is SKIPPED.
     // ─────────────────────────────────────────────────────────────────────────
+    // static List<(DateTime StartTime, DateTime EndTime, double StartLevel, double EndLevel, double DrainQuantity)>
+    //     DetectFuelDrainEvents(List<FuelRecord> records)
+    // {
+    //     var drainEvents = new List<(DateTime, DateTime, double, double, double)>(); // starttime, Endtime, startLevel , EndLevel , Drain Quantity....
+
+
+    //     if (records == null || records.Count < 3)
+    //         return drainEvents;
+
+    //     // Filter valid records and sort by time
+    //     var recs = records
+    //         .Where(r => r.FuelLevel > 0 && r.Rtc != DateTime.MinValue)
+    //         .OrderBy(r => r.Rtc)
+    //         .ToList();
+
+    //     if (recs.Count < 3)
+    //         return drainEvents;
+
+    //     int n = recs.Count;
+
+    //     // ── Median-3 smoothing to remove single-sample sensor spikes ──
+    //     var sm = new double[n];
+    //     for (int s = 0; s < n; s++)
+    //     {
+    //         int lo = Math.Max(0, s - 1);
+    //         int hi = Math.Min(n - 1, s + 1);
+    //         double a = recs[lo].FuelLevel, b = recs[s].FuelLevel, c = recs[hi].FuelLevel;
+    //         sm[s] = a < b ? (b < c ? b : (a < c ? c : a))
+    //                       : (a < c ? a : (b < c ? c : b));
+    //     }
+
+    //     // ── Thresholds ──
+    //     const double minDrainLitres       = 5.0;      // minimum litres to flag as drain
+    //     const double falseEventNearLitres = 5.0;       // if fuel recovers within 5L of initial → false event
+    //     const int    falseEventLookahead  = 20;        // records to check for recovery
+    //     const double maxSpeedForDrain     = 5.0;       // tag_388 speed limit — above this vehicle is moving (sloshing)
+    //     const double maxSpeedForLongDrain = 0.0;       // tag_388 speed limit for scenario 3
+    //     const double quickWindowSec       = 5 * 60;    // 5 minutes for scenario 1
+    //     const double longWindowSec        = 60 * 60;   // 60 minutes max for scenario 3
+
+    //     // Track the end-time of the last drain so we don't double-count
+    //     DateTime lastDrainEnd = DateTime.MinValue;
+
+    //     for (int i = 0; i < n; i++)
+    //     {
+    //         if (recs[i].Rtc <= lastDrainEnd)
+    //             continue;
+
+    //         double initialLevel = sm[i];
+    //         double initialRawLevel = recs[i].FuelLevel;
+
+    //         // ═══════════════════════════════════════════════════════════════════
+    //         //  PRE-CHECK: U-shape detector
+    //         //  Scan forward up to 60 minutes. If fuel drops then rises back
+    //         //  within 5L of the starting point (U or V shape), skip this
+    //         //  starting point — it is sensor noise / sloshing, not a drain.
+    //         // ═══════════════════════════════════════════════════════════════════
+    //         {
+    //             const double uShapeWindowSec = 60 * 60; // scan up to 60 min
+    //             const double uShapeRecoveryLitres = 5.0; // within 5L of start = recovered
+
+    //             double uMin = initialRawLevel;
+    //             int uMinIdx = i;
+    //             bool uDropFound = false;
+    //             bool uRecovered = false;
+
+    //             for (int k = i + 1; k < n; k++)
+    //             {
+    //                 if ((recs[k].Rtc - recs[i].Rtc).TotalSeconds > uShapeWindowSec) break;
+
+    //                 // Track deepest point
+    //                 if (recs[k].FuelLevel < uMin)
+    //                 {
+    //                     uMin = recs[k].FuelLevel;
+    //                     uMinIdx = k;
+    //                 }
+
+    //                 // Have we seen a significant dip?
+    //                 double dipFromStart = initialRawLevel - uMin;
+    //                 if (dipFromStart >= minDrainLitres)
+    //                     uDropFound = true;
+
+    //                 // After a significant dip, check if fuel comes back up
+    //                 if (uDropFound && k > uMinIdx)
+    //                 {
+    //                     if (Math.Abs(recs[k].FuelLevel - initialRawLevel) <= uShapeRecoveryLitres)
+    //                     {
+    //                         uRecovered = true;
+    //                         break;
+    //                     }
+    //                 }
+    //             }
+
+    //             if (uDropFound && uRecovered)
+    //             {
+    //                 Console.WriteLine(
+    //                     $"[SKIP-UShape] {recs[i].Rtc:HH:mm:ss} | " +
+    //                     $"Start={initialRawLevel:F2}L, dipped to {uMin:F2}L at {recs[uMinIdx].Rtc:HH:mm:ss}, " +
+    //                     $"then recovered => U-shape, not drain");
+    //                 continue; // skip to next i — this is a U-shape, not a drain
+    //             }
+    //         }
+
+    //         // ═══════════════════════════════════════════════════════════════════
+    //         //  SCENARIO 1: Quick drain within 5 minutes
+    //         //  Fuel drops sharply within 5 min. Then check the FUEL VALUES
+    //         //  over the next 15–20 minutes:
+    //         //    - If fuel increases back to the starting point (within 1L)
+    //         //      within 20 min → NOT a drain, skip (undulation).
+    //         //    - If fuel stays low or keeps decreasing and never recovers
+    //         //      near the starting point → confirmed DRAIN.
+    //         // ═══════════════════════════════════════════════════════════════════
+    //         {
+    //             int jMax = i;
+    //             for (int k = i + 1; k < n; k++)
+    //             {
+    //                 if ((recs[k].Rtc - recs[i].Rtc).TotalSeconds > quickWindowSec) break;
+    //                 jMax = k;
+    //             }
+
+    //             if (jMax > i)
+    //             {
+    //                 // Find the lowest point in the 5-min window
+    //                 double lowestLevel = initialLevel;
+    //                 int lowestIdx = i;
+    //                 for (int k = i + 1; k <= jMax; k++)
+    //                 {
+    //                     if (sm[k] < lowestLevel)
+    //                     {
+    //                         lowestLevel = sm[k];
+    //                         lowestIdx = k;
+    //                     }
+    //                 }
+
+    //                 double drop = initialLevel - lowestLevel;
+    //                 if (drop >= minDrainLitres && lowestIdx > i)
+    //                 {
+    //                     // Speed gate: if vehicle is moving fast during the drop, it's
+    //                     // fuel sloshing (sensor noise), not a real drain.
+    //                     double avgSpeed = 0;
+    //                     int speedCount = 0;
+    //                     for (int k = i; k <= lowestIdx; k++)
+    //                     {
+    //                         avgSpeed += recs[k].Speed;
+    //                         speedCount++;
+    //                     }
+    //                     avgSpeed = speedCount > 0 ? avgSpeed / speedCount : 0;
+
+    //                     if (avgSpeed > maxSpeedForDrain)
+    //                     {
+    //                         Console.WriteLine(
+    //                             $"[SKIP-Moving-S1] {recs[i].Rtc:HH:mm:ss}->{recs[lowestIdx].Rtc:HH:mm:ss} " +
+    //                             $"Drop={drop:F2}L but avg speed={avgSpeed:F1} km/h => sloshing, not drain");
+    //                     }
+    //                     else
+    //                     {
+    //                     // After the sudden drop, monitor fuel VALUES for 15–20 minutes.
+    //                     // If at any point fuel climbs back near the initial level → undulation.
+    //                     // If fuel stays low / keeps dropping → drain.
+    //                     const double postDropMonitorSec = 20 * 60; // 20 minutes
+
+    //                     bool recovered = false;
+    //                     bool keepsDecreasing = true;
+    //                     double lowestAfterDrop = recs[lowestIdx].FuelLevel;
+    //                     int finalIdx = lowestIdx; // track where fuel ends up
+
+    //                     for (int k = lowestIdx + 1; k < n; k++)
+    //                     {
+    //                         double elapsed = (recs[k].Rtc - recs[lowestIdx].Rtc).TotalSeconds;
+    //                         if (elapsed > postDropMonitorSec) break;
+
+    //                         // Check if fuel recovered back near the starting point (within 5L)
+    //                         if (Math.Abs(recs[k].FuelLevel - initialRawLevel) <= falseEventNearLitres)
+    //                         {
+    //                             recovered = true;
+    //                             break;
+    //                         }
+    //                         // Check if fuel rebounded ≥ 50% of the drop
+    //                         double rebound = recs[k].FuelLevel - recs[lowestIdx].FuelLevel;
+    //                         if (rebound >= drop * 0.50)
+    //                         {
+    //                             recovered = true;
+    //                             break;
+    //                         }
+
+    //                         // Track if fuel is still decreasing or staying low
+    //                         if (recs[k].FuelLevel > lowestAfterDrop + 1.0)
+    //                         {
+    //                             keepsDecreasing = false;
+    //                         }
+    //                         if (recs[k].FuelLevel < lowestAfterDrop)
+    //                         {
+    //                             lowestAfterDrop = recs[k].FuelLevel;
+    //                             finalIdx = k;
+    //                         }
+    //                     }
+
+    //                     if (recovered)
+    //                     {
+    //                         Console.WriteLine(
+    //                             $"[SKIP-Recovered-S1] {recs[i].Rtc:HH:mm:ss}->{recs[lowestIdx].Rtc:HH:mm:ss} " +
+    //                             $"Drop={drop:F2}L but fuel recovered to initial within 20 min => undulation");
+    //                     }
+    //                     else
+    //                     {
+    //                         // Fuel did NOT recover — stays low or keeps decreasing → DRAIN
+    //                         // Use the final lowest point if fuel kept decreasing further
+    //                         int drainEndIdx = keepsDecreasing ? finalIdx : lowestIdx;
+    //                         double startLevel = recs[i].FuelLevel;
+    //                         double endLevel = recs[drainEndIdx].FuelLevel;
+    //                         double drainQty = startLevel - endLevel;
+    //                         if (drainQty >= minDrainLitres)
+    //                         {
+    //                             drainEvents.Add((recs[i].Rtc, recs[drainEndIdx].Rtc, startLevel, endLevel, drainQty));
+    //                             lastDrainEnd = recs[drainEndIdx].Rtc;
+    //                             i = drainEndIdx;
+    //                             Console.WriteLine(
+    //                                 $"[DRAIN-Scenario1] {recs[i].Rtc:HH:mm:ss} | " +
+    //                                 $"Level: {startLevel:F2}L -> {endLevel:F2}L | Drained={drainQty:F2}L | " +
+    //                                 $"KeepsDecreasing={keepsDecreasing}");
+    //                             continue;
+    //                         }
+    //                     }
+    //                 }
+    //                 } // end speed gate else
+    //             }
+    //         }
+
+    //         // ═══════════════════════════════════════════════════════════════════
+    //         //  SCENARIO 2: Zigzag drain (↓↑↓↑↓)
+    //         //  Fuel oscillates: decrease-increase-decrease-increase-decrease.
+    //         //  After the pattern, fuel never returns to initial level.
+    //         //  Net loss must be > 5 L.
+    //         // ═══════════════════════════════════════════════════════════════════
+    //         {
+    //             // Walk forward looking for zigzag: at least 2 down-up-down cycles
+    //             int zigzagEnd = -1;
+    //             int downCount = 0;
+    //             int upCount = 0;
+    //             bool inDown = false;
+    //             bool inUp = false;
+    //             double runningMin = initialLevel;
+    //             int runningMinIdx = i;
+
+    //             for (int k = i + 1; k < n; k++)
+    //             {
+    //                 // Limit scan to 30 minutes
+    //                 if ((recs[k].Rtc - recs[i].Rtc).TotalMinutes > 30) break;
+
+    //                 double diff = sm[k] - sm[k - 1];
+
+    //                 if (diff < -0.5) // decreasing
+    //                 {
+    //                     if (!inDown)
+    //                     {
+    //                         inDown = true;
+    //                         inUp = false;
+    //                         downCount++;
+    //                     }
+    //                 }
+    //                 else if (diff > 0.5) // increasing
+    //                 {
+    //                     if (!inUp)
+    //                     {
+    //                         inUp = true;
+    //                         inDown = false;
+    //                         upCount++;
+    //                     }
+    //                 }
+
+    //                 if (sm[k] < runningMin)
+    //                 {
+    //                     runningMin = sm[k];
+    //                     runningMinIdx = k;
+    //                 }
+
+    //                 // Need at least 3 downs and 2 ups for a zigzag pattern (↓↑↓↑↓)
+    //                 if (downCount >= 3 && upCount >= 2)
+    //                 {
+    //                     zigzagEnd = k;
+    //                 }
+    //             }
+
+    //             if (zigzagEnd > 0)
+    //             {
+    //                 // After zigzag, check that fuel didn't recover to initial
+    //                 double netLoss = initialLevel - runningMin;
+    //                 double endSmLevel = sm[zigzagEnd];
+    //                 double finalLoss = initialLevel - endSmLevel;
+
+    //                 if (finalLoss >= minDrainLitres)
+    //                 {
+    //                     // Verify final level is NOT near initial (use raw level)
+    //                     if (Math.Abs(recs[zigzagEnd].FuelLevel - initialRawLevel) > falseEventNearLitres)
+    //                     {
+    //                         // Apply false-event filter using raw fuel levels
+    //                         if (!IsFalseEvent(recs, n, zigzagEnd, initialRawLevel, falseEventLookahead, falseEventNearLitres, finalLoss))
+    //                         {
+    //                             double startLevel = recs[i].FuelLevel;
+    //                             double endLevel = recs[zigzagEnd].FuelLevel;
+    //                             double drainQty = startLevel - endLevel;
+    //                             if (drainQty >= minDrainLitres)
+    //                             {
+    //                                 drainEvents.Add((recs[i].Rtc, recs[zigzagEnd].Rtc, startLevel, endLevel, drainQty));
+    //                                 lastDrainEnd = recs[zigzagEnd].Rtc;
+    //                                 i = zigzagEnd;
+    //                                 Console.WriteLine(
+    //                                     $"[DRAIN-Scenario2-Zigzag] {recs[i].Rtc:HH:mm:ss} | " +
+    //                                     $"Level: {startLevel:F2}L -> {endLevel:F2}L | Drained={drainQty:F2}L | " +
+    //                                     $"Downs={downCount} Ups={upCount}");
+    //                                 continue;
+    //                             }
+    //                         }
+    //                         else
+    //                         {
+    //                             Console.WriteLine(
+    //                                 $"[SKIP-FalseEvent-S2] {recs[i].Rtc:HH:mm:ss}->{recs[zigzagEnd].Rtc:HH:mm:ss} " +
+    //                                 $"ZigzagDrop={finalLoss:F2}L but next 20 records recover => false event");
+    //                         }
+    //                     }
+    //                 }
+    //             }
+    //         }
+
+    //         // ═══════════════════════════════════════════════════════════════════
+    //         //  SCENARIO 3: Long-period drain with small spikes
+    //         //  Fuel decreases over a long period with small intermediate spikes,
+    //         //  then a big decrease. Speed (tag_388) must be ≤ 1 during the
+    //         //  long period. If the last point doesn't recover near start → drain.
+    //         // ═══════════════════════════════════════════════════════════════════
+    //         {
+    //             // Scan forward up to 60 minutes for a sustained decrease with spikes
+    //             int jMax = i;
+    //             for (int k = i + 1; k < n; k++)
+    //             {
+    //                 if ((recs[k].Rtc - recs[i].Rtc).TotalSeconds > longWindowSec) break;
+    //                 jMax = k;
+    //             }
+
+    //             if (jMax > i + 5) // need enough records for a long-period pattern
+    //             {
+    //                 // Find the overall lowest point in this window
+    //                 double lowestLevel = initialLevel;
+    //                 int lowestIdx = i;
+    //                 bool hasSmallSpikes = false;
+    //                 bool hasBigDrop = false;
+
+    //                 for (int k = i + 1; k <= jMax; k++)
+    //                 {
+    //                     // Detect small spikes (brief increases amid overall decrease)
+    //                     if (sm[k] > sm[k - 1] && (sm[k] - sm[k - 1]) < 3.0)
+    //                         hasSmallSpikes = true;
+
+    //                     // Detect big drop (single step > 3L)
+    //                     if ((sm[k - 1] - sm[k]) > 3.0)
+    //                         hasBigDrop = true;
+
+    //                     if (sm[k] < lowestLevel)
+    //                     {
+    //                         lowestLevel = sm[k];
+    //                         lowestIdx = k;
+    //                     }
+    //                 }
+
+    //                 double totalDrop = initialLevel - lowestLevel;
+
+    //                 if (totalDrop >= minDrainLitres && (hasSmallSpikes || hasBigDrop) && lowestIdx > i)
+    //                 {
+    //                     // Speed check: tag_388 should be ≤ 1 for most of the drain period
+    //                     int lowSpeedCount = 0;
+    //                     int totalChecked = 0;
+    //                     for (int k = i; k <= lowestIdx; k++)
+    //                     {
+    //                         totalChecked++;
+    //                         if (recs[k].Speed <= maxSpeedForLongDrain)
+    //                             lowSpeedCount++;
+    //                     }
+
+    //                     // At least 70% of records must have speed ≤ 1
+    //                     double lowSpeedRatio = totalChecked > 0 ? (double)lowSpeedCount / totalChecked : 0;
+
+    //                     if (lowSpeedRatio >= 0.70)
+    //                     {
+    //                         // Check that last point doesn't recover near starting point (use raw level)
+    //                         if (Math.Abs(recs[lowestIdx].FuelLevel - initialRawLevel) > falseEventNearLitres)
+    //                         {
+    //                             // Apply false-event filter using raw fuel levels
+    //                             if (!IsFalseEvent(recs, n, lowestIdx, initialRawLevel, falseEventLookahead, falseEventNearLitres, totalDrop))
+    //                             {
+    //                                 double startLevel = recs[i].FuelLevel;
+    //                                 double endLevel = recs[lowestIdx].FuelLevel;
+    //                                 double drainQty = startLevel - endLevel;
+    //                                 if (drainQty >= minDrainLitres)
+    //                                 {
+    //                                     drainEvents.Add((recs[i].Rtc, recs[lowestIdx].Rtc, startLevel, endLevel, drainQty));
+    //                                     lastDrainEnd = recs[lowestIdx].Rtc;
+    //                                     i = lowestIdx;
+    //                                     Console.WriteLine(
+    //                                         $"[DRAIN-Scenario3-LongPeriod] {recs[i].Rtc:HH:mm:ss} | " +
+    //                                         $"Level: {startLevel:F2}L -> {endLevel:F2}L | Drained={drainQty:F2}L | " +
+    //                                         $"LowSpeedRatio={lowSpeedRatio:P0}");
+    //                                     continue;
+    //                                 }
+    //                             }
+    //                             else
+    //                             {
+    //                                 Console.WriteLine(
+    //                                     $"[SKIP-FalseEvent-S3] {recs[i].Rtc:HH:mm:ss}->{recs[lowestIdx].Rtc:HH:mm:ss} " +
+    //                                     $"LongDrop={totalDrop:F2}L but next 20 records recover => false event");
+    //                             }
+    //                         }
+    //                     }
+    //                     else
+    //                     {
+    //                         Console.WriteLine(
+    //                             $"[SKIP-SpeedTooHigh-S3] {recs[i].Rtc:HH:mm:ss}->{recs[lowestIdx].Rtc:HH:mm:ss} " +
+    //                             $"Drop={totalDrop:F2}L but speed>1 in {(1 - lowSpeedRatio) * 100:F0}% of records => likely consumption");
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //     }
+
+    //     return drainEvents;
+    // }
+
+
+ // ═══════════════════════════════════════════════════════════════════════
+    //  DRAIN DETECTION — Continuous-decrease scanner
+    //
+    //  Two detection modes:
+    //
+    //  A) DRAIN: Fuel decreases over 30-40 records within 0-40 min.
+    //     Find where fuel started decreasing → find the minimum point.
+    //     Check next 20 records: if fuel recovers near start → NOT drain.
+    //     If fuel stays low → CONFIRMED DRAIN.
+    //     Rate must exceed normal consumption for asset type.
+    //
+    //  B) OVERCONSUMPTION: Fuel decreases continuously up to 1 hr.
+    //     Stationary normal = 40 L/hr, Mobile normal = 10-15 L/hr.
+    //     If actual rate exceeds normal → Overconsumption flagged.
+    //
+    //  Plateau detection (min 10 records) is used as supporting evidence
+    //  for pre/post stability but the main scanner works on raw data.
+    // ═══════════════════════════════════════════════════════════════════════
     static List<(DateTime StartTime, DateTime EndTime, double StartLevel, double EndLevel, double DrainQuantity)>
-        DetectFuelDrainEvents(List<FuelRecord> records)
+        DetectFuelDrainEvents(List<FuelRecord> records, DateTime reportCutoff, string? movementType = null)
     {
-        var drainEvents = new List<(DateTime, DateTime, double, double, double)>();
+        var drainEvents = new List<(DateTime StartTime, DateTime EndTime, double StartLevel, double EndLevel, double DrainQuantity)>();
 
         if (records == null || records.Count < 3)
             return drainEvents;
 
-        // Filter valid records and sort by time
+        // ── Asset-type thresholds ──
+        bool isStationary = IsStationaryAsset(movementType);
+        // Normal consumption rates (L/hr)
+        double normalConsumptionLPerHr = isStationary ? 40.0 : 15.0;
+        // Drain rate must exceed this — drains are much faster than consumption
+        double minDrainRateLPerHr = isStationary ? 50.0 : 25.0;
+        Console.WriteLine($"[Drain] Asset: {(isStationary ? "Stationary" : "Mobile")} ('{movementType}') → normalRate={normalConsumptionLPerHr}L/hr, minDrainRate={minDrainRateLPerHr}L/hr");
+
         var recs = records
-            .Where(r => r.FuelLevel > 0 && r.Rtc != DateTime.MinValue)
+            .Where(r => r.FuelLevel > 0 && r.Rtc != DateTime.MinValue && r.Rtc <= reportCutoff)
             .OrderBy(r => r.Rtc)
             .ToList();
 
@@ -641,7 +1257,7 @@ class Program
 
         int n = recs.Count;
 
-        // ── Median-3 smoothing to remove sensor spikes / undulation ──
+        // ── STEP 0: Median-3 smoothing ──
         var sm = new double[n];
         for (int s = 0; s < n; s++)
         {
@@ -653,166 +1269,435 @@ class Program
         }
 
         // ── Thresholds ──
-        const double minDrainThreshold = 10.0;     // minimum litres to flag as drain
-        const double windowMinSeconds  = 5 * 60;   // 5 minutes
-        const double windowMaxSeconds  = 10 * 60;  // 10 minutes
-        const double suddenDropRatio   = 0.60;     // ≥60% of total drop in 1-2 steps → sudden
+        const double minDrainLitres      = 5.0;    // minimum drop to flag (L)
+        const double stabilityBand       = 3.0;    // max swing in a plateau (L)
+        const int    minPlateauSec       = 50;     // min plateau duration (seconds)
+        const int    minPlateauRecords   = 10;     // min records in a plateau (increased from 5 to 10)
+        const double maxDrainDurationMin = 40.0;   // max drain duration (minutes)
+        const int    recoveryLookahead   = 20;     // check next 20 records for recovery
+        const double recoveryNearL       = 7.0;    // if fuel recovers within 7L of start → no drain
+        const int    minDecreaseRecords  = 30;     // minimum 30 records of continuous decrease for drain
+        const int    maxDecreaseRecords  = 500;    // generous cap — actual stop is via stabilization detection
+        const double maxRiseInRun        = 5.0;    // allow brief sensor noise rises up to 5L
+        const double maxScanWindowMin    = 180.0;  // scan up to 3 hours to capture multi-stage drains
+        const int    stabilizationCount  = 15;     // stop when fuel is flat for 15 records after minimum
+        const double largeDrainThresholdStationary = 45.0; // drops > 50L → DRAIN for stationary assets
+        const double largeDrainThresholdMobile     = 20.0; // drops > 30L → DRAIN for mobile assets
 
-        // Track the end-time of the last accepted drain so we don't double-count
-        DateTime lastDrainEnd = DateTime.MinValue;
-
-        for (int i = 0; i < n; i++)
+        // ═══════════════════════════════════════════════════════════════════════
+        //  STEP 1: Identify stable plateaus (for pre/post stability checks)
+        // ═══════════════════════════════════════════════════════════════════════
+        var plateaus = new List<(int startIdx, int endIdx, double level, double durationSec)>();
+        int pi = 0;
+        while (pi < n)
         {
-            // Skip if this point is inside a previously detected drain window
-            if (recs[i].Rtc <= lastDrainEnd)
-                continue;
+            double pMin = sm[pi], pMax = sm[pi];
+            int pEnd = pi;
 
-            // ── Find the farthest index j within the 10-min window ──
-            int jMax = i;
-            for (int k = i + 1; k < n; k++)
+            for (int k = pi + 1; k < n; k++)
             {
-                double elapsedSec = (recs[k].Rtc - recs[i].Rtc).TotalSeconds;
-                if (elapsedSec > windowMaxSeconds) break;
-                jMax = k;
+                double newMin = Math.Min(pMin, sm[k]);
+                double newMax = Math.Max(pMax, sm[k]);
+                if (newMax - newMin > stabilityBand) break;
+                pMin = newMin;
+                pMax = newMax;
+                pEnd = k;
             }
 
-            if (jMax == i) continue;
+            double durSec = (recs[pEnd].Rtc - recs[pi].Rtc).TotalSeconds;
+            int cnt = pEnd - pi + 1;
 
-            // ── Search for the best (largest) drain within [i .. jMax] ──
-            // Walk forward and track the peak (highest smoothed level) and
-            // lowest subsequent point within the window.
-            double peakLevel = sm[i];
-            int peakIdx = i;
-            double bestDrain = 0;
-            int bestDrainEndIdx = i;
-
-            for (int j = i + 1; j <= jMax; j++)
+            if (durSec >= minPlateauSec && cnt >= minPlateauRecords)
             {
-                if (sm[j] > peakLevel)
-                {
-                    peakLevel = sm[j];
-                    peakIdx = j;
-                }
+                var rawVals = new List<double>(cnt);
+                for (int k = pi; k <= pEnd; k++)
+                    rawVals.Add(recs[k].FuelLevel);
+                rawVals.Sort();
+                double medianLevel = rawVals[rawVals.Count / 2];
 
-                double drop = peakLevel - sm[j];
-                if (drop > bestDrain)
-                {
-                    bestDrain = drop;
-                    bestDrainEndIdx = j;
-                }
+                plateaus.Add((pi, pEnd, medianLevel, durSec));
+                pi = pEnd + 1;
             }
-
-            // ── Gate 1: minimum drain quantity ──
-            if (bestDrain < minDrainThreshold)
-                continue;
-
-            // ── Gate 2: must be within the 5–10 min window ──
-            double durationSec = (recs[bestDrainEndIdx].Rtc - recs[peakIdx].Rtc).TotalSeconds;
-            if (durationSec < windowMinSeconds || durationSec > windowMaxSeconds)
+            else
             {
-                // Also check if the drain is just under 5 min but very large — still accept
-                if (!(bestDrain >= minDrainThreshold * 2 && durationSec >= 60))
-                    continue;
+                pi++;
             }
-
-            // ── Gate 3: Suddenness check — distinguish drain from normal consumption ──
-            // Normal consumption: fuel drops slowly and uniformly across many steps.
-            // Drain: one or two large step-drops dominate the total decrease.
-            double maxSingleStepDrop = 0;
-            double maxTwoConsecDrop = 0;
-            double prevStepDrop = 0;
-
-            for (int k = peakIdx + 1; k <= bestDrainEndIdx; k++)
-            {
-                double stepDrop = sm[k - 1] - sm[k]; // positive means fuel decreased
-                if (stepDrop > maxSingleStepDrop)
-                    maxSingleStepDrop = stepDrop;
-
-                double twoStepDrop = stepDrop + prevStepDrop;
-                if (twoStepDrop > maxTwoConsecDrop)
-                    maxTwoConsecDrop = twoStepDrop;
-
-                prevStepDrop = stepDrop;
-            }
-
-            double dominantDrop = Math.Max(maxSingleStepDrop, maxTwoConsecDrop);
-            if (dominantDrop < bestDrain * suddenDropRatio)
-            {
-                // The decrease is spread uniformly — likely normal consumption, not drain
-                Console.WriteLine(
-                    $"[SKIP-NormalConsumption] " +
-                    $"{recs[peakIdx].Rtc:HH:mm:ss}->{recs[bestDrainEndIdx].Rtc:HH:mm:ss} " +
-                    $"Drop={bestDrain:F2}L but dominant step={dominantDrop:F2}L " +
-                    $"({dominantDrop / bestDrain * 100:F0}% < {suddenDropRatio * 100}%) => normal consumption");
-                continue;
-            }
-
-            // ── Gate 4: Undulation filter — if fuel bounces back up within undulationBand ──
-            // Check a few records after the drain end; if fuel recovers significantly,
-            // it was sensor noise, not a real drain.
-            bool bouncedBack = false;
-            int checkEnd = Math.Min(n - 1, bestDrainEndIdx + 5);
-            for (int k = bestDrainEndIdx + 1; k <= checkEnd; k++)
-            {
-                double recovery = sm[k] - sm[bestDrainEndIdx];
-                if (recovery > bestDrain * 0.50)
-                {
-                    bouncedBack = true;
-                    break;
-                }
-            }
-            if (bouncedBack)
-            {
-                Console.WriteLine(
-                    $"[SKIP-Undulation] " +
-                    $"{recs[peakIdx].Rtc:HH:mm:ss}->{recs[bestDrainEndIdx].Rtc:HH:mm:ss} " +
-                    $"Drop={bestDrain:F2}L but fuel bounced back => sensor noise");
-                continue;
-            }
-
-            // ── Gate 5: Post-drain sustained low level check ──
-            // After a real drain, fuel should STAY low. Check that the average
-            // level in the 3 minutes after drain end is still below start - 50% of drain.
-            double postCheckSec = 180;
-            var postVals = new List<double>();
-            for (int k = bestDrainEndIdx; k < n; k++)
-            {
-                if ((recs[k].Rtc - recs[bestDrainEndIdx].Rtc).TotalSeconds > postCheckSec)
-                    break;
-                postVals.Add(sm[k]);
-            }
-            if (postVals.Count >= 2)
-            {
-                double postAvg = postVals.Average();
-                if (postAvg > peakLevel - bestDrain * 0.50)
-                {
-                    Console.WriteLine(
-                        $"[SKIP-NotSustained] " +
-                        $"{recs[peakIdx].Rtc:HH:mm:ss}->{recs[bestDrainEndIdx].Rtc:HH:mm:ss} " +
-                        $"Drop={bestDrain:F2}L but post-avg={postAvg:F2} (peak={peakLevel:F2}) => not sustained");
-                    continue;
-                }
-            }
-
-            // ═══ DRAIN EVENT CONFIRMED ═══
-            double startLevel = recs[peakIdx].FuelLevel;
-            double endLevel = recs[bestDrainEndIdx].FuelLevel;
-            double drainQty = startLevel - endLevel;
-
-            drainEvents.Add((
-                recs[peakIdx].Rtc,
-                recs[bestDrainEndIdx].Rtc,
-                startLevel,
-                endLevel,
-                drainQty
-            ));
-
-            lastDrainEnd = recs[bestDrainEndIdx].Rtc;
-            // Advance past the drain event
-            i = bestDrainEndIdx;
         }
 
+        Console.WriteLine($"[Drain] Found {plateaus.Count} stable plateaus (minRec={minPlateauRecords})");
+
+        var detectedEvents = new List<(DateTime start, DateTime end)>();
+
+        // ═══════════════════════════════════════════════════════════════════════
+        //  STEP 2: Scan for continuous decrease runs (30-40+ records)
+        //
+        //  Algorithm:
+        //    1. Walk through records, find where fuel starts decreasing
+        //    2. Track the run: count decreasing steps, find minimum point
+        //    3. If ≥30 records are in the run AND total drop ≥ 5L:
+        //       a) Duration must be ≤ 40 min for DRAIN
+        //       b) Check next 20 records after minimum: does fuel recover
+        //          back near the starting level?
+        //          - YES → NOT a drain (sensor noise / undulation)
+        //          - NO  → CONFIRMED DRAIN
+        //       c) Rate must exceed normal consumption for the asset type
+        //    4. If decrease runs up to 1 hr but rate > normal → Overconsumption
+        // ═══════════════════════════════════════════════════════════════════════
+        for (int i = 0; i < n - minDecreaseRecords; i++)
+        {
+            // Skip if already within a detected event
+            bool inDetected = false;
+            foreach (var (ds, de) in detectedEvents)
+            {
+                if (recs[i].Rtc >= ds && recs[i].Rtc <= de)
+                { inDetected = true; break; }
+            }
+            if (inDetected) continue;
+
+            double startLevel = recs[i].FuelLevel;
+            double runningMin = startLevel;
+            int runningMinIdx = i;
+            int decreasingSteps = 0;
+            int totalSteps = 0;
+
+            // Scan forward for continuous decrease (up to 3 hours, stop on stabilization)
+            for (int k = i + 1; k < n && totalSteps < maxDecreaseRecords; k++)
+            {
+                double elapsedMin = (recs[k].Rtc - recs[i].Rtc).TotalMinutes;
+                if (elapsedMin > maxScanWindowMin) break;
+
+                double stepDiff = recs[k].FuelLevel - recs[k - 1].FuelLevel;
+                totalSteps++;
+
+                if (stepDiff <= 0)
+                    decreasingSteps++;
+                else if (stepDiff > maxRiseInRun)
+                    break; // significant rise = end of decrease run
+
+                if (recs[k].FuelLevel < runningMin)
+                {
+                    runningMin = recs[k].FuelLevel;
+                    runningMinIdx = k;
+                }
+
+                // ── Stabilization detection ──
+                // If we've passed the minimum point and fuel has been flat for
+                // 15+ consecutive records, the decline is over — stop scanning.
+                if (totalSteps >= minDecreaseRecords && k - runningMinIdx >= stabilizationCount)
+                {
+                    double recentMin = double.MaxValue, recentMax = double.MinValue;
+                    for (int r = k - stabilizationCount + 1; r <= k; r++)
+                    {
+                        recentMin = Math.Min(recentMin, recs[r].FuelLevel);
+                        recentMax = Math.Max(recentMax, recs[r].FuelLevel);
+                    }
+                    if (recentMax - recentMin <= stabilityBand)
+                        break; // fuel has stabilized at new level
+                }
+            }
+
+            // Need at least 30 records of mostly-decreasing data
+            if (totalSteps < minDecreaseRecords) continue;
+
+            double totalDrop = startLevel - runningMin;
+            if (totalDrop < minDrainLitres) continue;
+
+            // At least 70% of steps must be decreasing
+            double monoScore = (double)decreasingSteps / totalSteps;
+            if (monoScore < 0.70) continue;
+
+            double durationMin = (recs[runningMinIdx].Rtc - recs[i].Rtc).TotalMinutes;
+            if (durationMin <= 0) continue;
+
+            double durationHrs = durationMin / 60.0;
+            double rate = totalDrop / durationHrs;
+
+            // Skip if overlaps already-detected event
+            bool overlap = false;
+            foreach (var (ds, de) in detectedEvents)
+            {
+                if (recs[i].Rtc < de && recs[runningMinIdx].Rtc > ds)
+                { overlap = true; break; }
+            }
+            if (overlap) continue;
+
+            // ── Speed check: asset must be mostly stationary during drain ──
+            {
+                double speedSum = 0; int speedCnt = 0;
+                for (int k = i; k <= runningMinIdx; k++)
+                { speedSum += recs[k].Speed; speedCnt++; }
+                double avgSpeed = speedCnt > 0 ? speedSum / speedCnt : 0;
+                if (avgSpeed > 5.0)
+                {
+                    Console.WriteLine(
+                        $"[SKIP-Moving] {recs[i].Rtc:HH:mm:ss} -> {recs[runningMinIdx].Rtc:HH:mm:ss} " +
+                        $"Drop={totalDrop:F2}L avgSpeed={avgSpeed:F1} => moving, skip");
+                    continue;
+                }
+            }
+
+            // ── RECOVERY CHECK: Check next 20 records after minimum ──
+            // If fuel recovers back near the starting level → NOT a drain
+            bool recovered = false;
+            int checkEnd = Math.Min(n, runningMinIdx + 1 + recoveryLookahead);
+            for (int k = runningMinIdx + 1; k < checkEnd; k++)
+            {
+                if (Math.Abs(recs[k].FuelLevel - startLevel) <= recoveryNearL)
+                {
+                    recovered = true;
+                    Console.WriteLine(
+                        $"[SKIP-Recovered] {recs[i].Rtc:HH:mm:ss} -> {recs[runningMinIdx].Rtc:HH:mm:ss} " +
+                        $"Drop={totalDrop:F2}L recovered to {recs[k].FuelLevel:F2}L at {recs[k].Rtc:HH:mm:ss} " +
+                        $"(within 20 records) => NOT drain");
+                    break;
+                }
+            }
+            if (recovered) continue;
+
+            // ── Spike-recovery check ──
+            // If fuel was already low BEFORE the start, the "high" is just a sensor spike
+            if (i > 5)
+            {
+                var lookbackCutoff = recs[i].Rtc.AddMinutes(-10);
+                var ctxVals = new List<double>();
+                for (int k = i - 1; k >= 0; k--)
+                {
+                    if (recs[k].Rtc < lookbackCutoff) break;
+                    ctxVals.Add(recs[k].FuelLevel);
+                }
+                if (ctxVals.Count >= 3)
+                {
+                    double ctxMin = ctxVals.Min();
+                    if (ctxMin <= runningMin + stabilityBand)
+                    {
+                        Console.WriteLine(
+                            $"[SKIP-SpikeRecovery] {recs[i].Rtc:HH:mm:ss} -> {recs[runningMinIdx].Rtc:HH:mm:ss} " +
+                            $"Drop={totalDrop:F2}L but pre-level={ctxMin:F2} ≈ post-level={runningMin:F2} => spike");
+                        continue;
+                    }
+                }
+            }
+
+            // ── Classify: DRAIN vs OVERCONSUMPTION ──
+            double largeDrainThreshold = isStationary ? largeDrainThresholdStationary : largeDrainThresholdMobile;
+            string eventType;
+            if (durationMin <= maxDrainDurationMin && rate >= minDrainRateLPerHr)
+            {
+                // Fast drop within 40 min at high rate → DRAIN
+                eventType = "DRAIN";
+            }
+            else if (totalDrop >= largeDrainThreshold)
+            {
+                // Massive drop (>50L stationary, >30L mobile) → DRAIN regardless of rate
+                // A generator doesn't lose 50+L naturally — this is theft/leak
+                eventType = "DRAIN";
+            }
+            else if (rate > normalConsumptionLPerHr)
+            {
+                // Slower or longer but rate exceeds normal consumption → OVERCONSUMPTION
+                eventType = "OVERCONSUMPTION";
+            }
+            else
+            {
+                // Rate is within normal consumption range → skip
+                Console.WriteLine(
+                    $"[SKIP-NormalConsumption] {recs[i].Rtc:HH:mm:ss} -> {recs[runningMinIdx].Rtc:HH:mm:ss} " +
+                    $"Drop={totalDrop:F2}L rate={rate:F1}L/hr ≤ normal={normalConsumptionLPerHr}L/hr => normal consumption");
+                continue;
+            }
+
+            // ═══ CONFIRMED EVENT ═══
+            drainEvents.Add((recs[i].Rtc, recs[runningMinIdx].Rtc, startLevel, runningMin, totalDrop));
+            detectedEvents.Add((recs[i].Rtc, recs[runningMinIdx].Rtc));
+
+            Console.WriteLine(
+                $"[{eventType}] {recs[i].Rtc:yyyy-MM-dd HH:mm:ss} -> {recs[runningMinIdx].Rtc:yyyy-MM-dd HH:mm:ss} | " +
+                $"Level: {startLevel:F2}L -> {runningMin:F2}L | Drop={totalDrop:F2}L | " +
+                $"Duration={durationMin:F1}min | Rate={rate:F1}L/hr | " +
+                $"Records={totalSteps} DecPct={monoScore:P0}");
+
+            // Skip past this event
+            i = runningMinIdx;
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        //  STEP 3: Plateau-based drain detection (backup)
+        //
+        //  Catches drains that the continuous scanner misses because
+        //  the decrease has < 30 records (e.g. sharp 5-min drops).
+        //  Uses stable plateaus: STABLE_HIGH → DROP → STABLE_LOW
+        // ═══════════════════════════════════════════════════════════════════════
+        if (plateaus.Count >= 2)
+        {
+            const double preStabilityMinSec  = 120.0;
+            const double postStabilityMinSec = 120.0;
+
+            for (int p = 0; p < plateaus.Count - 1; p++)
+            {
+                var prev = plateaus[p];
+                var next = plateaus[p + 1];
+
+                double drop = prev.level - next.level;
+                if (drop < minDrainLitres) continue;
+
+                // Pre-plateau must be genuinely stable (≥2 min)
+                if (prev.durationSec < preStabilityMinSec) continue;
+
+                // Post-plateau must be genuinely stable (≥2 min)
+                if (next.durationSec < postStabilityMinSec) continue;
+
+                // Find raw MAX in prev plateau (last occurrence)
+                int rawMaxIdx = prev.startIdx;
+                double rawMaxVal = recs[prev.startIdx].FuelLevel;
+                for (int k = prev.startIdx + 1; k <= prev.endIdx; k++)
+                {
+                    if (recs[k].FuelLevel >= rawMaxVal)
+                    { rawMaxVal = recs[k].FuelLevel; rawMaxIdx = k; }
+                }
+
+                // Find raw MIN in next plateau + transition zone
+                int rawMinIdx = next.startIdx;
+                double rawMinVal = recs[next.startIdx].FuelLevel;
+                for (int k = prev.endIdx + 1; k < next.startIdx && k < n; k++)
+                {
+                    if (recs[k].FuelLevel < rawMinVal)
+                    { rawMinVal = recs[k].FuelLevel; rawMinIdx = k; }
+                }
+                for (int k = next.startIdx; k <= next.endIdx; k++)
+                {
+                    if (recs[k].FuelLevel < rawMinVal)
+                    { rawMinVal = recs[k].FuelLevel; rawMinIdx = k; }
+                }
+
+                double rawDrain = rawMaxVal - rawMinVal;
+                if (rawDrain < minDrainLitres) continue;
+
+                // Refine timing: find actual transition boundaries
+                int drainStartIdx = rawMaxIdx;
+                for (int k = rawMaxIdx + 1; k <= rawMinIdx; k++)
+                {
+                    if (recs[k].FuelLevel >= rawMaxVal - stabilityBand)
+                        drainStartIdx = k;
+                    else
+                        break;
+                }
+                int drainEndIdx = rawMinIdx;
+                for (int k = drainStartIdx + 1; k <= rawMinIdx; k++)
+                {
+                    if (recs[k].FuelLevel <= rawMinVal + stabilityBand)
+                    { drainEndIdx = k; break; }
+                }
+
+                double drainDurMin = (recs[drainEndIdx].Rtc - recs[drainStartIdx].Rtc).TotalMinutes;
+                if (drainDurMin > maxDrainDurationMin) continue;
+
+                double drainDurHrs = drainDurMin / 60.0;
+                double drainRate = drainDurHrs > 0 ? rawDrain / drainDurHrs : 0;
+                if (drainRate < minDrainRateLPerHr)
+                {
+                    Console.WriteLine(
+                        $"[SKIP-SlowRate-PLAT] {recs[drainStartIdx].Rtc:HH:mm:ss} -> {recs[drainEndIdx].Rtc:HH:mm:ss} " +
+                        $"Drop={rawDrain:F2}L rate={drainRate:F1}L/hr < {minDrainRateLPerHr}L/hr => consumption");
+                    continue;
+                }
+
+                // Skip if overlaps already-detected event
+                bool overlapPlat = false;
+                foreach (var (ds, de) in detectedEvents)
+                {
+                    if (recs[drainStartIdx].Rtc < de && recs[drainEndIdx].Rtc > ds)
+                    { overlapPlat = true; break; }
+                }
+                if (overlapPlat) continue;
+
+                // Recovery check: next 20 records after drain end
+                bool recoveredPlat = false;
+                int platCheckEnd = Math.Min(n, drainEndIdx + 1 + recoveryLookahead);
+                for (int k = drainEndIdx + 1; k < platCheckEnd; k++)
+                {
+                    if (Math.Abs(recs[k].FuelLevel - rawMaxVal) <= recoveryNearL)
+                    {
+                        recoveredPlat = true;
+                        Console.WriteLine(
+                            $"[SKIP-Recovered-PLAT] {recs[drainStartIdx].Rtc:HH:mm:ss} -> {recs[drainEndIdx].Rtc:HH:mm:ss} " +
+                            $"Drop={rawDrain:F2}L recovered to {recs[k].FuelLevel:F2}L => NOT drain");
+                        break;
+                    }
+                }
+                if (recoveredPlat) continue;
+
+                // Spike-recovery check
+                if (prev.startIdx > 2)
+                {
+                    var lookbackCutoff = recs[prev.startIdx].Rtc.AddMinutes(-10);
+                    var ctxVals = new List<double>();
+                    for (int k = prev.startIdx - 1; k >= 0; k--)
+                    {
+                        if (recs[k].Rtc < lookbackCutoff) break;
+                        ctxVals.Add(recs[k].FuelLevel);
+                    }
+                    if (ctxVals.Count >= 3)
+                    {
+                        double ctxMin = ctxVals.Min();
+                        if (ctxMin <= rawMinVal + stabilityBand)
+                        {
+                            Console.WriteLine(
+                                $"[SKIP-SpikeRecovery-PLAT] {recs[drainStartIdx].Rtc:HH:mm:ss} -> {recs[drainEndIdx].Rtc:HH:mm:ss} " +
+                                $"Drop={rawDrain:F2}L pre-level={ctxMin:F2} ≈ post-level={rawMinVal:F2} => spike");
+                            continue;
+                        }
+                    }
+                }
+
+                // Speed check
+                {
+                    double speedSum = 0; int speedCnt = 0;
+                    for (int k = drainStartIdx; k <= drainEndIdx; k++)
+                    { speedSum += recs[k].Speed; speedCnt++; }
+                    double avgSpeed = speedCnt > 0 ? speedSum / speedCnt : 0;
+                    if (avgSpeed > 5.0) continue;
+                }
+
+                // ═══ CONFIRMED PLATEAU DRAIN ═══
+                drainEvents.Add((recs[drainStartIdx].Rtc, recs[drainEndIdx].Rtc, rawMaxVal, rawMinVal, rawDrain));
+                detectedEvents.Add((recs[drainStartIdx].Rtc, recs[drainEndIdx].Rtc));
+
+                Console.WriteLine(
+                    $"[DRAIN-PLAT] {recs[drainStartIdx].Rtc:yyyy-MM-dd HH:mm:ss} -> {recs[drainEndIdx].Rtc:yyyy-MM-dd HH:mm:ss} | " +
+                    $"Level: {rawMaxVal:F2}L -> {rawMinVal:F2}L | Drained={rawDrain:F2}L | " +
+                    $"Duration={drainDurMin:F1}min | Rate={drainRate:F1}L/hr | " +
+                    $"PreStable={prev.durationSec:F0}s PostStable={next.durationSec:F0}s");
+            }
+        }
+
+        drainEvents.Sort((a, b) => a.StartTime.CompareTo(b.StartTime));
         return drainEvents;
+    }
+
+
+
+    /// <summary>
+    /// False-event filter using RAW fuel levels (not smoothed).
+    /// Checks if any of the next <paramref name="lookahead"/> records after
+    /// <paramref name="drainEndIdx"/> come within <paramref name="nearLitres"/> of
+    /// <paramref name="initialLevel"/>, OR rebound ≥50% of the drop.
+    /// If so, the drain is a false event (undulation / sensor noise).
+    /// </summary>
+    static bool IsFalseEvent(List<FuelRecord> recs, int n, int drainEndIdx, double initialLevel, int lookahead, double nearLitres, double dropAmount)
+    {
+        int checkTo = Math.Min(n - 1, drainEndIdx + lookahead);
+        double drainEndLevel = recs[drainEndIdx].FuelLevel;
+        for (int k = drainEndIdx + 1; k <= checkTo; k++)
+        {
+            // Check if raw fuel level comes back within 1L of the initial level
+            if (Math.Abs(recs[k].FuelLevel - initialLevel) <= nearLitres)
+                return true;
+            // Check if fuel rebounds ≥ 50% of the drop (undulation)
+            double rebound = recs[k].FuelLevel - drainEndLevel;
+            if (dropAmount > 0 && rebound >= dropAmount * 0.50)
+                return true;
+        }
+        return false;
     }
 
 
@@ -833,6 +1718,7 @@ class Program
                 m.tag_386, 
                 m.tag_387, 
                 m.tag_388,
+                m.tag_627,
                 d.assettypename
               FROM ""Fuel_Prod"".m_fuel_metric_calc_dist m
               LEFT JOIN ""Fuel_Prod"".d_lntassetmaster d 
@@ -855,6 +1741,7 @@ class Program
                 Latitude = reader.IsDBNull(reader.GetOrdinal("tag_386")) ? 0 : Convert.ToDouble(reader["tag_386"]),
                 Longitude = reader.IsDBNull(reader.GetOrdinal("tag_387")) ? 0 : Convert.ToDouble(reader["tag_387"]),
                 Speed = reader.IsDBNull(reader.GetOrdinal("tag_388")) ? 0 : Convert.ToDouble(reader["tag_388"]),
+                Tag627 = reader.IsDBNull(reader.GetOrdinal("tag_627")) ? 0 : Convert.ToDouble(reader["tag_627"]),
                 AssetTypeName= reader.IsDBNull(reader.GetOrdinal("assettypename"))? "Unknown" : reader.GetString(reader.GetOrdinal("assettypename"))
             });
         }
@@ -1644,7 +2531,7 @@ class Program
     {
         Console.WriteLine($"\n--- Searching for AssetCode: {assetCode} ---");
 
-        if (!TryGetDeviceId(connString, assetCode, out int deviceId, out string? jobCode))
+        if (!TryGetDeviceId(connString, assetCode, out int deviceId, out string? jobCode, out _))
         {
             Console.WriteLine($"No device found for asset code {assetCode}.");
             return;
@@ -1711,7 +2598,7 @@ class Program
 
         foreach (var assetCode in assetCodes)
         {
-            if (!TryGetDeviceId(appSettings.ConnectionStrings.CitusDb, assetCode, out int deviceId, out string? jobCode))
+            if (!TryGetDeviceId(appSettings.ConnectionStrings.CitusDb, assetCode, out int deviceId, out string? jobCode, out _))
                 continue;
 
             var records = FetchFuelRecords(appSettings.ConnectionStrings.CitusDb, deviceId, startTime, endTime);
@@ -1796,7 +2683,7 @@ class Program
 
         foreach (var assetCode in assetCodes)
         {
-            if (!TryGetDeviceId(appSettings.ConnectionStrings.CitusDb, assetCode, out int deviceId, out string? jobCode))
+            if (!TryGetDeviceId(appSettings.ConnectionStrings.CitusDb, assetCode, out int deviceId, out string? jobCode, out _))
                 continue;
 
             var records = FetchFuelRecords(appSettings.ConnectionStrings.CitusDb, deviceId, startTime, endTime);
@@ -3083,6 +3970,14 @@ class Program
         const double postPeakDropMaxPct = 0.25;  // reject if drop > 25% of gain
         const int    postPeakCheckSec   = 600;   // 10-minute post-peak window
 
+        // ── Long-term decay: reject noise spikes that return to baseline ──
+        // A real refuel permanently raises fuel level. If 15-30 min after peak
+        // the median fuel level has dropped back near the pre-refuel level,
+        // the "gain" was sensor noise / undulation, not a real refuel.
+        const int    longTermCheckStartSec = 900;   // start checking 15 min after peak
+        const int    longTermCheckEndSec   = 1800;  // up to 30 min after peak
+        const double longTermRetainPct     = 0.40;  // fuel must retain ≥40% of gain
+
         var reportBuilder = new StringBuilder();
         double refuelTotal = 0;
 
@@ -3313,6 +4208,33 @@ class Program
                             $"{recs[swMinIdx].Rtc:MM-dd HH:mm} → {recs[swMaxIdx].Rtc:MM-dd HH:mm} " +
                             $"Gain={swRawGain:F2}L PostMin={swPostMin:F2} Drop={swDrop:F2}L " +
                             $"({swDrop / swRawGain * 100:F0}% of gain) — undulation");
+                        continue;
+                    }
+                }
+            }
+
+            // ── Long-term decay check (Stepwise) ──
+            {
+                var swLtStart = recs[swMaxIdx].Rtc.AddSeconds(longTermCheckStartSec);
+                var swLtEnd   = recs[swMaxIdx].Rtc.AddSeconds(longTermCheckEndSec);
+                var swLtVals  = new List<double>();
+                for (int k = swMaxIdx + 1; k < n; k++)
+                {
+                    if (recs[k].Rtc < swLtStart) continue;
+                    if (recs[k].Rtc > swLtEnd) break;
+                    swLtVals.Add(recs[k].FuelLevel);
+                }
+                if (swLtVals.Count >= 5)
+                {
+                    swLtVals.Sort();
+                    double swLtMedian = swLtVals[swLtVals.Count / 2];
+                    double swMinRetain = swMinVal + swRawGain * longTermRetainPct;
+                    if (swLtMedian < swMinRetain)
+                    {
+                        Console.WriteLine($"[REJECTED-LongTermDecay-Stepwise] {assetCode} " +
+                            $"{recs[swMinIdx].Rtc:MM-dd HH:mm} → {recs[swMaxIdx].Rtc:MM-dd HH:mm} " +
+                            $"Gain={swRawGain:F2}L LtMedian={swLtMedian:F2}L " +
+                            $"MinRetain={swMinRetain:F2}L — fuel decayed back (undulation)");
                         continue;
                     }
                 }
@@ -3613,6 +4535,36 @@ class Program
                 }
             }
 
+            // ── Long-term decay check (Consecutive) ──
+            // A real refuel permanently raises fuel. If 15-30 min later the
+            // median fuel level has dropped back near the pre-refuel level,
+            // it was sensor noise / undulation.
+            {
+                var ltStart = recs[rawMaxIdx].Rtc.AddSeconds(longTermCheckStartSec);
+                var ltEnd   = recs[rawMaxIdx].Rtc.AddSeconds(longTermCheckEndSec);
+                var ltVals  = new List<double>();
+                for (int k = rawMaxIdx + 1; k < n; k++)
+                {
+                    if (recs[k].Rtc < ltStart) continue;
+                    if (recs[k].Rtc > ltEnd) break;
+                    ltVals.Add(recs[k].FuelLevel);
+                }
+                if (ltVals.Count >= 5)
+                {
+                    ltVals.Sort();
+                    double ltMedian = ltVals[ltVals.Count / 2];
+                    double minRetainLevel = rawMinVal + rawGain * longTermRetainPct;
+                    if (ltMedian < minRetainLevel)
+                    {
+                        Console.WriteLine($"[REJECTED-LongTermDecay] {assetCode} " +
+                            $"{recs[rawMinIdx].Rtc:MM-dd HH:mm} → {recs[rawMaxIdx].Rtc:MM-dd HH:mm} " +
+                            $"Gain={rawGain:F2}L LtMedian={ltMedian:F2}L " +
+                            $"MinRetain={minRetainLevel:F2}L — fuel decayed back (undulation)");
+                        continue;
+                    }
+                }
+            }
+
             // ── Confidence: now based on plateau quality ──
             // Both plateaus exist by definition (≥60s, ≥3 records), so we check
             // their raw range for tighter stability.
@@ -3780,6 +4732,33 @@ class Program
                                         $"({drop3a / rawGain3a * 100:F0}% of gain) — undulation");
                                 }
                             }
+                            // ── Long-term decay check (PrePlateau) ──
+                            if (!postDrop3a)
+                            {
+                                var lt3aStart = recs[peakIdx3a].Rtc.AddSeconds(longTermCheckStartSec);
+                                var lt3aEnd   = recs[peakIdx3a].Rtc.AddSeconds(longTermCheckEndSec);
+                                var lt3aVals  = new List<double>();
+                                for (int k = peakIdx3a + 1; k < n; k++)
+                                {
+                                    if (recs[k].Rtc < lt3aStart) continue;
+                                    if (recs[k].Rtc > lt3aEnd) break;
+                                    lt3aVals.Add(recs[k].FuelLevel);
+                                }
+                                if (lt3aVals.Count >= 5)
+                                {
+                                    lt3aVals.Sort();
+                                    double lt3aMedian = lt3aVals[lt3aVals.Count / 2];
+                                    double minRetain3a = recs[troughIdx].FuelLevel + rawGain3a * longTermRetainPct;
+                                    if (lt3aMedian < minRetain3a)
+                                    {
+                                        postDrop3a = true;
+                                        Console.WriteLine($"[REJECTED-LongTermDecay-PrePlateau] {assetCode} " +
+                                            $"{recs[troughIdx].Rtc:MM-dd HH:mm} → {recs[peakIdx3a].Rtc:MM-dd HH:mm} " +
+                                            $"Gain={rawGain3a:F2}L LtMedian={lt3aMedian:F2}L " +
+                                            $"MinRetain={minRetain3a:F2}L — fuel decayed back (undulation)");
+                                    }
+                                }
+                            }
                             if (!postDrop3a)
                         {
                         string conf3a = rawGain3a >= 25 ? "High" : rawGain3a >= 15 ? "Medium" : "Low";
@@ -3873,6 +4852,33 @@ class Program
                             $"{recs[gTroughIdx].Rtc:MM-dd HH:mm} → {recs[gPeakIdx].Rtc:MM-dd HH:mm} " +
                             $"Gain={gRawGain:F2}L PostMin={postMin3b:F2} Drop={drop3b:F2}L " +
                             $"({drop3b / gRawGain * 100:F0}% of gain) — undulation");
+                        continue;
+                    }
+                }
+            }
+
+            // ── Long-term decay check (GapDetect) ──
+            {
+                var ltGStart = recs[gPeakIdx].Rtc.AddSeconds(longTermCheckStartSec);
+                var ltGEnd   = recs[gPeakIdx].Rtc.AddSeconds(longTermCheckEndSec);
+                var ltGVals  = new List<double>();
+                for (int k = gPeakIdx + 1; k < n; k++)
+                {
+                    if (recs[k].Rtc < ltGStart) continue;
+                    if (recs[k].Rtc > ltGEnd) break;
+                    ltGVals.Add(recs[k].FuelLevel);
+                }
+                if (ltGVals.Count >= 5)
+                {
+                    ltGVals.Sort();
+                    double ltGMedian = ltGVals[ltGVals.Count / 2];
+                    double minRetainG = recs[gTroughIdx].FuelLevel + gRawGain * longTermRetainPct;
+                    if (ltGMedian < minRetainG)
+                    {
+                        Console.WriteLine($"[REJECTED-LongTermDecay-GapDetect] {assetCode} " +
+                            $"{recs[gTroughIdx].Rtc:MM-dd HH:mm} → {recs[gPeakIdx].Rtc:MM-dd HH:mm} " +
+                            $"Gain={gRawGain:F2}L LtMedian={ltGMedian:F2}L " +
+                            $"MinRetain={minRetainG:F2}L — fuel decayed back (undulation)");
                         continue;
                     }
                 }

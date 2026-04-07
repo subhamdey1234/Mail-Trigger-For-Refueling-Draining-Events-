@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("mail_trigger")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+707be5e90e7c8651ab61387fe23fe68b05671e59")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+8e761671df3bc9f353c70f4acf523dfcacb51fe6")]
 [assembly: System.Reflection.AssemblyProductAttribute("mail_trigger")]
 [assembly: System.Reflection.AssemblyTitleAttribute("mail_trigger")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
